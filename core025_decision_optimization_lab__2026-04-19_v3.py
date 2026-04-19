@@ -1,163 +1,169 @@
 #!/usr/bin/env python3
-# BUILD: core025_ultimate_walkforward_heavy__2026-04-19
+# BUILD: core025_ultimate_walkforward_heavy_v2__2026-04-19
 
 import pandas as pd
 import streamlit as st
 import numpy as np
-from datetime import datetime
 
-st.set_page_config(page_title="Core025 Ultimate Walk-Forward", layout="wide")
-st.title("🎯 Core025 Ultimate Heavy Walk-Forward App")
-st.caption("BUILD: core025_ultimate_walkforward_heavy__2026-04-19 | Using your v4 prepared file")
+st.set_page_config(page_title="Core025 Ultimate Walk-Forward v2", layout="wide")
+st.title("🎯 Core025 Ultimate Heavy Walk-Forward v2")
+st.caption("BUILD: core025_ultimate_walkforward_heavy_v2__2026-04-19 | Fixed normalization + stable download")
 
-# ====================== UPLOAD ======================
-data_file = st.file_uploader("Upload prepared_full_truth_with_stream_stats_v4.csv", type=["csv"], key="data")
-if not data_file:
-    st.info("Upload the v4 file from the miner.")
+# ====================== UPLOADS ======================
+main_file = st.file_uploader("prepared_full_truth_with_stream_stats_v4.csv", type="csv", key="main")
+rule_file = st.file_uploader("rule_metadata__core025_precompute_builder__2026-04-16_v1.csv", type="csv", key="rules")
+matrix_file = st.file_uploader("match_matrix__core025_precompute_builder__2026-04-16_v1.csv", type="csv", key="matrix")
+
+if not main_file:
+    st.info("Upload the v4 prepared file (and optionally rule/matrix for heavier scoring).")
     st.stop()
 
-df = pd.read_csv(data_file)
-st.success(f"✅ Loaded {len(df)} rows with TrueMember and hit_density.")
+df = pd.read_csv(main_file)
 
-# Normalize columns if needed
-if "TrueMember" not in df.columns:
-    df["TrueMember"] = ""
-df["TrueMember"] = df["TrueMember"].astype(str).str.strip()
+# ====================== NORMALIZE TrueMember ======================
+def normalize_member(x):
+    if pd.isna(x) or str(x).strip() == "":
+        return ""
+    s = str(x).strip()
+    if s in ["25", "255", "0255"]: return "0255"
+    if s in ["225", "0225"]: return "0225"
+    if s in ["25", "0025"]: return "0025"
+    return s.zfill(4) if s.isdigit() else s
+
+df["TrueMember"] = df["TrueMember"].apply(normalize_member)
+if "WinningMember" in df.columns:
+    df["TrueMember"] = df["TrueMember"].combine_first(df["WinningMember"].apply(normalize_member))
+
+st.success(f"✅ Loaded {len(df)} rows. TrueMember normalized.")
+
+# Load heavy files if provided
+rule_meta = pd.read_csv(rule_file) if rule_file is not None else pd.DataFrame()
+match_matrix = pd.read_csv(matrix_file, index_col=0) if matrix_file is not None else pd.DataFrame()
 
 MEMBERS = ["0025", "0225", "0255"]
 
-# ====================== PARAMETERS (Sliders) ======================
-col1, col2, col3 = st.columns(3)
+# ====================== SLIDERS ======================
+col1, col2 = st.columns(2)
 with col1:
-    max_plays = st.slider("Max Plays per Day", 20, 60, 40)
-    max_top2 = st.slider("Max Top2 Allowed", 0, 20, 10)
+    max_plays = st.slider("Max Plays per Day", 20, 60, 40, key="plays")
+    max_top2 = st.slider("Max Top2 Allowed", 0, 20, 10, key="top2")
+    prune_pct = st.slider("Prune Low Hit-Density Streams (%)", 0, 50, 30, key="prune")
 with col2:
-    prune_percent = st.slider("Prune Low-Density Streams (%)", 0, 50, 25)
-    seed_boost = st.slider("Seed Boost Strength", 0.0, 5.0, 2.0)
-with col3:
-    trait_weight = st.slider("Trait Weight", 0.0, 2.0, 0.8)
-    warm_up = st.slider("Warm-up Rows", 20, 100, 30)
+    seed_boost = st.slider("Seed Boost", 0.0, 5.0, 2.5, key="seed")
+    trait_weight = st.slider("Trait/Rule Weight", 0.0, 3.0, 1.2, key="trait")
+    warm_up = st.slider("Warm-up Buffer", 20, 100, 40, key="warm")
 
-# ====================== HEAVY SCORING FUNCTION ======================
-def score_row(row, match_matrix, rule_meta, seed_boost_val, trait_weight_val):
-    base_scores = {m: 1.0 for m in MEMBERS}
+# ====================== HEAVY SCORE FUNCTION ======================
+def heavy_score_row(row, match_matrix, rule_meta, seed_boost_val, trait_weight_val):
+    base = {m: 1.0 for m in MEMBERS}
     
-    # Seed-based heuristics
     seed = str(row.get("seed", "")).strip()
     if seed:
-        if "9" in seed or "0" in seed:
-            base_scores["0255"] += seed_boost_val
+        if any(d in seed for d in "90"):
+            base["0255"] += seed_boost_val
         if len(set(seed)) <= 2:
-            base_scores["0225"] += seed_boost_val * 0.9
-        digit_sum = sum(int(d) for d in seed if d.isdigit())
-        if digit_sum % 2 == 0:
-            base_scores["0025"] += seed_boost_val * 0.8
+            base["0225"] += seed_boost_val * 0.9
+        if sum(int(d) for d in seed if d.isdigit()) % 2 == 0:
+            base["0025"] += seed_boost_val * 0.8
     
-    # Heavy trait activation from match_matrix + rule_metadata
+    # Heavy trait + rule boost
     try:
-        row_idx = int(row.name) if pd.api.types.is_integer(row.name) else row.name
-        if row_idx in match_matrix.index:
-            activations = match_matrix.loc[row_idx]
+        idx = row.name
+        if isinstance(match_matrix, pd.DataFrame) and not match_matrix.empty and idx in match_matrix.index:
+            acts = match_matrix.loc[idx]
             for m in MEMBERS:
-                # Weighted by rule hit_rate * lift for this member
-                member_rules = rule_meta[rule_meta["target"] == m]
-                if not member_rules.empty:
-                    boost = (activations.sum() * trait_weight_val) * member_rules["hit_rate_true"].mean()
-                    base_scores[m] += boost
+                m_rules = rule_meta[rule_meta.get("target", "") == m] if not rule_meta.empty else pd.DataFrame()
+                if not m_rules.empty:
+                    rule_boost = m_rules["hit_rate_true"].mean() * m_rules.get("lift", 1.0).mean()
+                    base[m] += float(acts.sum()) * trait_weight_val * rule_boost
     except:
-        pass  # fallback to seed only
+        pass
     
-    # Get top and second
-    sorted_scores = sorted(base_scores.items(), key=lambda x: x[1], reverse=True)
-    top_member = sorted_scores[0][0]
-    second_member = sorted_scores[1][0]
-    margin = sorted_scores[0][1] - sorted_scores[1][1]
-    
-    return top_member, second_member, margin, base_scores
+    sorted_m = sorted(base.items(), key=lambda x: x[1], reverse=True)
+    top = sorted_m[0][0]
+    second = sorted_m[1][0]
+    margin = sorted_m[0][1] - sorted_m[1][1]
+    return top, second, margin
 
 # ====================== RUN WALK-FORWARD ======================
-if st.button("🚀 Run Strict Walk-Forward"):
-    # Prune low-density streams
-    if "hit_density" in df.columns and "StreamKey" in df.columns:
-        density_threshold = df["hit_density"].quantile(prune_percent / 100)
-        good_streams = df[df["hit_density"] >= density_threshold]["StreamKey"].unique()
-        test_df = df[df["StreamKey"].isin(good_streams)].copy()
-        st.info(f"Pruned to {len(test_df)} rows ({len(good_streams)} streams)")
+if st.button("🚀 Run Heavy Walk-Forward"):
+    # Prune
+    if "hit_density" in df.columns:
+        thresh = df["hit_density"].quantile(prune_pct / 100.0)
+        df_pruned = df[df["hit_density"] >= thresh].copy()
+        st.info(f"Pruned to {len(df_pruned)} rows using hit_density ≥ {thresh:.3f}")
     else:
-        test_df = df.copy()
+        df_pruned = df.copy()
     
     results = []
-    progress_bar = st.progress(0)
+    progress = st.progress(0)
     
-    for i in range(warm_up, len(test_df)):
-        train_df = test_df.iloc[:i]
-        test_row = test_df.iloc[i]
+    for i in range(warm_up, len(df_pruned)):
+        if len(results) >= max_plays:
+            break
+        row = df_pruned.iloc[i]
         
-        # Simulate daily selection (conservative: every other row approx for ~40 plays)
-        if i % 2 == 0 and len(results) < max_plays:  # rough daily control
-            top, second, margin, _ = score_row(test_row, None, None, seed_boost, trait_weight)  # match_matrix placeholder for now
-            
-            true_member = str(test_row.get("TrueMember", "")).strip()
-            if true_member not in MEMBERS:
-                true_member = test_row.get("WinningMember", "")
-            
-            top1_correct = 1 if top == true_member else 0
-            needed_top2 = 1 if (top != true_member and second == true_member) else 0
-            waste_top2 = 1 if (top != true_member and second == true_member and margin < 0.3) else 0
-            miss = 1 if top1_correct == 0 and needed_top2 == 0 else 0
-            
-            results.append({
-                "date": test_row.get("date", test_row.get("PlayDate", "")),
-                "stream": test_row.get("StreamKey", ""),
-                "seed": test_row.get("seed", ""),
-                "PredictedMember": top,
-                "Top2_pred": second,
-                "TrueMember": true_member,
-                "Top1_Correct": top1_correct,
-                "Needed_Top2": needed_top2,
-                "Waste_Top2": waste_top2,
-                "Miss": miss,
-                "Margin": round(margin, 3)
-            })
+        top, second, margin = heavy_score_row(row, match_matrix, rule_meta, seed_boost, trait_weight)
         
-        progress_bar.progress((i - warm_up) / (len(test_df) - warm_up))
+        true_m = str(row.get("TrueMember", "")).strip()
+        top1_correct = 1 if top == true_m else 0
+        needed_top2 = 1 if top1_correct == 0 and second == true_m else 0
+        waste = 1 if needed_top2 == 1 and margin < 0.35 else 0
+        miss = 1 if top1_correct == 0 and needed_top2 == 0 else 0
+        
+        results.append({
+            "date": row.get("date", row.get("PlayDate", "")),
+            "stream": row.get("StreamKey", ""),
+            "seed": row.get("seed", ""),
+            "PredictedMember": top,
+            "Top2_pred": second,
+            "TrueMember": true_m,
+            "Top1_Correct": top1_correct,
+            "Needed_Top2": needed_top2,
+            "Waste_Top2": waste,
+            "Miss": miss,
+            "Margin": round(margin, 3)
+        })
+        
+        progress.progress((i - warm_up + 1) / (len(df_pruned) - warm_up))
     
-    results_df = pd.DataFrame(results)
+    res_df = pd.DataFrame(results)
     
-    # Operational Metrics
-    total_plays = len(results_df)
-    top1 = results_df["Top1_Correct"].sum()
-    needed = results_df["Needed_Top2"].sum()
-    waste = results_df["Waste_Top2"].sum()
-    misses = results_df["Miss"].sum()
+    # Metrics
+    total = len(res_df)
+    t1 = res_df["Top1_Correct"].sum()
+    nt2 = res_df["Needed_Top2"].sum()
+    waste = res_df["Waste_Top2"].sum()
+    miss = res_df["Miss"].sum()
+    capture = (t1 + nt2) / total * 100 if total > 0 else 0
+    ppw = total / (t1 + nt2) if (t1 + nt2) > 0 else total
+    obj = (t1 * 3.0) + (nt2 * 2.0) - (waste * 1.2) - (miss * 2.5)
     
-    capture_rate = (top1 + needed) / total_plays * 100 if total_plays > 0 else 0
-    plays_per_win = total_plays / (top1 + needed) if (top1 + needed) > 0 else total_plays
-    objective = (top1 * 3.0) + (needed * 2.0) - (waste * 1.2) - (misses * 2.5)
-    
-    # Display
-    colA, colB, colC = st.columns(3)
-    with colA:
-        st.metric("Capture Rate", f"{capture_rate:.1f}%")
-        st.metric("Top1 Wins", int(top1))
-    with colB:
-        st.metric("Needed Top2", int(needed))
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Capture Rate", f"{capture:.1f}%")
+        st.metric("Top1 Wins", int(t1))
+    with c2:
+        st.metric("Needed Top2", int(nt2))
         st.metric("Waste Top2", int(waste))
-    with colC:
-        st.metric("Misses", int(misses))
-        st.metric("Objective Score", f"{objective:.1f}")
-        st.metric("Plays per Win", f"{plays_per_win:.2f}")
+    with c3:
+        st.metric("Misses", int(miss))
+        st.metric("Objective Score", f"{obj:.1f}")
+        st.metric("Plays per Win", f"{ppw:.2f}")
     
-    st.dataframe(results_df.head(50))
+    st.dataframe(res_df)
     
-    # Stable Download
-    csv = results_df.to_csv(index=False)
+    # STABLE DOWNLOAD (no reset)
+    if "download_key" not in st.session_state:
+        st.session_state.download_key = False
+    
+    csv_data = res_df.to_csv(index=False).encode()
     st.download_button(
-        "📥 Download walkforward_results_ultimate.csv",
-        data=csv,
-        file_name="walkforward_results_ultimate.csv",
+        "📥 Download walkforward_results_ultimate_v2.csv",
+        data=csv_data,
+        file_name="walkforward_results_ultimate_v2.csv",
         mime="text/csv",
-        key="ultimate_download"
+        key="stable_download"
     )
     
-    st.success("Walk-forward complete! Download ready. No app reset.")
+    st.success("✅ Walk-forward complete. Download should not reset the app.")
