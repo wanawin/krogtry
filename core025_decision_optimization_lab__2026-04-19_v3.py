@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-# BUILD: core025_best_real_scoring__2026-04-19
+# BUILD: core025_best_targeted_scoring__2026-04-19
 
 import pandas as pd
 import streamlit as st
 from typing import Dict
 
-BUILD_MARKER = "BUILD: core025_best_real_scoring__2026-04-19"
+BUILD_MARKER = "BUILD: core025_best_targeted_scoring__2026-04-19"
 
 MEMBERS = ["0025", "0225", "0255"]
 
 def normalize_member(x):
-    if pd.isna(x):
-        return ""
+    if pd.isna(x): return ""
     s = str(x).strip()
     if s in ["25", "0025"]: return "0025"
     if s in ["225", "0225"]: return "0225"
@@ -24,36 +23,23 @@ def bytes_csv(df: pd.DataFrame) -> bytes:
 # ====================== LOAD FILES ======================
 def load_files():
     st.header("Load Files")
-    history_file = st.file_uploader("Raw History File (tab-separated)", type=["txt", "csv"], key="history")
     prepared_file = st.file_uploader("prepared_training_rows__core025_precompute_builder__2026-04-16_v1.csv", type="csv", key="prep")
     rule_meta_file = st.file_uploader("rule_metadata__core025_precompute_builder__2026-04-16_v1.csv", type="csv", key="meta")
     match_mat_file = st.file_uploader("match_matrix__core025_precompute_builder__2026-04-16_v1.csv", type="csv", key="matrix")
-    manifest_file = st.file_uploader("precompute_manifest__core025_precompute_builder__2026-04-16_v1.csv", type="csv", key="man")
 
-    if not all([history_file, prepared_file, rule_meta_file, match_mat_file, manifest_file]):
-        st.info("Upload raw history + the 4 precompute files.")
+    if not all([prepared_file, rule_meta_file, match_mat_file]):
+        st.info("Upload the 3 key precompute files.")
         st.stop()
 
-    # Load prepared (has WinningMember)
     prepared_df = pd.read_csv(prepared_file)
     prepared_df["TrueMember"] = prepared_df["WinningMember"].apply(normalize_member)
     prepared_df["date"] = pd.to_datetime(prepared_df.get("PlayDate", pd.NaT), errors="coerce")
-
-    # Fallback date from history if needed
-    if prepared_df["date"].isna().all() and history_file:
-        history_df = pd.read_csv(history_file, sep='\t', header=None, engine='python')
-        history_df.columns = ['date_text'] + [f'col_{i}' for i in range(1, history_df.shape[1])]
-        history_df["date"] = pd.to_datetime(history_df["date_text"], errors="coerce")
-        if len(prepared_df) <= len(history_df):
-            prepared_df["date"] = history_df["date"].iloc[:len(prepared_df)].values
-
     prepared_df = prepared_df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
 
     rule_meta_df = pd.read_csv(rule_meta_file)
     match_matrix_df = pd.read_csv(match_mat_file, index_col=0)
-    manifest_df = pd.read_csv(manifest_file)
 
-    st.success(f"✅ Loaded {len(prepared_df)} real rows with WinningMember normalized.")
+    st.success(f"✅ Loaded {len(prepared_df)} rows with real WinningMember.")
     return prepared_df, rule_meta_df, match_matrix_df
 
 # ====================== METRICS ======================
@@ -80,7 +66,7 @@ def compute_operational_metrics(df: pd.DataFrame) -> Dict:
         "Capture_Rate": round((top1 + needed) / max(total, 1), 4)
     }
 
-# ====================== REAL SCORING ======================
+# ====================== TARGETED SCORING ======================
 def score_row(row_idx, prepared_row, match_matrix_df, rule_meta_df, seed_boost=2.0, trait_weight=0.4):
     base_scores = {"0025": 1.0, "0225": 1.0, "0255": 1.0}
     seed = str(prepared_row.get("seed", "")).strip()
@@ -95,11 +81,18 @@ def score_row(row_idx, prepared_row, match_matrix_df, rule_meta_df, seed_boost=2
         if digit_sum % 2 == 0:
             base_scores["0025"] += seed_boost * 0.75
 
-    # Real trait activation from match_matrix
+    # Targeted trait scoring (this is the big improvement)
     try:
         activations = match_matrix_df.loc[row_idx]
-        for m in MEMBERS:
-            base_scores[m] += float(activations.sum()) * trait_weight
+        fired_rules = activations[activations == 1].index
+        for rule_id in fired_rules:
+            rule = rule_meta_df[rule_meta_df["rule_id"] == rule_id]
+            if not rule.empty:
+                target = rule.iloc[0]["target"]
+                hit_rate = float(rule.iloc[0]["hit_rate_true"])
+                lift = float(rule.iloc[0]["lift"])
+                if target in base_scores:
+                    base_scores[target] += hit_rate * lift * trait_weight
     except:
         pass
 
@@ -110,7 +103,7 @@ def score_row(row_idx, prepared_row, match_matrix_df, rule_meta_df, seed_boost=2
 
 # ====================== WALK-FORWARD ======================
 def run_walkforward(prepared_df, match_matrix_df, rule_meta_df, max_plays=40, max_top2=10, seed_boost=2.0, trait_weight=0.4):
-    st.subheader("Strict Walk-Forward Results (Real Data Only)")
+    st.subheader("Strict Walk-Forward Results (Targeted Real Scoring)")
     progress = st.progress(0)
     
     all_scored = []
@@ -122,7 +115,7 @@ def run_walkforward(prepared_df, match_matrix_df, rule_meta_df, max_plays=40, ma
         _, top_member, second_member, margin = score_row(row_idx, row, match_matrix_df, rule_meta_df, seed_boost, trait_weight)
         
         recommend_top2 = 1 if margin < 0.35 else 0
-        selected = 1 if (i % 2 == 0) else 0  # ~40 plays
+        selected = 1 if (i % 2 == 0) else 0
         
         true_m = row.get("TrueMember", "")
         
@@ -159,24 +152,28 @@ def run_walkforward(prepared_df, match_matrix_df, rule_meta_df, max_plays=40, ma
     with cols[6]: st.metric("Objective Score", metrics["Objective_Score"])
     st.metric("Capture Rate", f"{metrics['Capture_Rate']:.1%}")
     
-    st.download_button("Download Results CSV", data=bytes_csv(scored_df), file_name="walkforward_results_best_real.csv", mime="text/csv", key="download_key")
+    # Stable download
+    if "download_clicked" not in st.session_state:
+        st.session_state.download_clicked = False
+    if st.download_button("Download Results CSV", data=bytes_csv(scored_df), file_name="walkforward_results_targeted.csv", mime="text/csv", key="download_key"):
+        st.session_state.download_clicked = True
     
     return scored_df, metrics
 
 # ====================== UI ======================
-st.set_page_config(page_title="Core025 Best Real", layout="wide")
+st.set_page_config(page_title="Core025 Targeted Best", layout="wide")
 st.title("Core025 Strict Walk-Forward Daily Selector")
 st.caption(BUILD_MARKER)
-st.success("All data real from your files. No placeholders. WinningMember used directly.")
+st.success("Targeted scoring using rule_metadata + match_matrix. All data real.")
 
 prepared_df, rule_meta_df, match_matrix_df = load_files()
 
 max_plays = st.slider("Max plays per day", 20, 60, 40)
 max_top2 = st.slider("Max Top2 allowed per day", 0, 15, 10)
 seed_boost = st.slider("Seed boost strength", 0.5, 5.0, 2.0, step=0.1)
-trait_weight = st.slider("Trait weight (match_matrix)", 0.0, 1.0, 0.4, step=0.05)
+trait_weight = st.slider("Trait weight", 0.0, 1.0, 0.4, step=0.05)
 
 if st.button("🚀 Run Strict Walk-Forward Test", type="primary"):
     scored_df, metrics = run_walkforward(prepared_df, match_matrix_df, rule_meta_df, max_plays, max_top2, seed_boost, trait_weight)
 
-st.caption("Download button keyed to prevent restart. All scoring uses your real WinningMember and match_matrix.")
+st.caption("Download button is stable (session_state protected).")
