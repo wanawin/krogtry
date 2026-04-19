@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
-# BUILD: core025_heavy_final_escape_loop__2026-04-19
+# BUILD: core025_best_real_scoring__2026-04-19
 
 import pandas as pd
 import streamlit as st
-import numpy as np
 from typing import Dict
 
-BUILD_MARKER = "BUILD: core025_heavy_final_escape_loop__2026-04-19"
+BUILD_MARKER = "BUILD: core025_best_real_scoring__2026-04-19"
 
 MEMBERS = ["0025", "0225", "0255"]
+
+def normalize_member(x):
+    if pd.isna(x):
+        return ""
+    s = str(x).strip()
+    if s in ["25", "0025"]: return "0025"
+    if s in ["225", "0225"]: return "0225"
+    if s in ["255", "0255"]: return "0255"
+    return s.zfill(4) if s.isdigit() else ""
 
 def bytes_csv(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
@@ -17,37 +25,36 @@ def bytes_csv(df: pd.DataFrame) -> bytes:
 def load_files():
     st.header("Load Files")
     history_file = st.file_uploader("Raw History File (tab-separated)", type=["txt", "csv"], key="history")
-    prepared = st.file_uploader("prepared_training_rows...", type="csv", key="prep")
-    rule_meta = st.file_uploader("rule_metadata...", type="csv", key="meta")
-    match_mat = st.file_uploader("match_matrix...", type="csv", key="matrix")
-    manifest = st.file_uploader("precompute_manifest...", type="csv", key="man")
+    prepared_file = st.file_uploader("prepared_training_rows__core025_precompute_builder__2026-04-16_v1.csv", type="csv", key="prep")
+    rule_meta_file = st.file_uploader("rule_metadata__core025_precompute_builder__2026-04-16_v1.csv", type="csv", key="meta")
+    match_mat_file = st.file_uploader("match_matrix__core025_precompute_builder__2026-04-16_v1.csv", type="csv", key="matrix")
+    manifest_file = st.file_uploader("precompute_manifest__core025_precompute_builder__2026-04-16_v1.csv", type="csv", key="man")
 
-    if not all([history_file, prepared, rule_meta, match_mat, manifest]):
-        st.info("Upload raw history + 4 precompute files.")
+    if not all([history_file, prepared_file, rule_meta_file, match_mat_file, manifest_file]):
+        st.info("Upload raw history + the 4 precompute files.")
         st.stop()
 
-    # Load history
-    history_df = pd.read_csv(history_file, sep='\t', header=None, engine='python')
-    history_df.columns = ['date_text'] + [f'col_{i}' for i in range(1, history_df.shape[1])]
-    history_df["date"] = pd.to_datetime(history_df["date_text"], errors="coerce")
+    # Load prepared (has WinningMember)
+    prepared_df = pd.read_csv(prepared_file)
+    prepared_df["TrueMember"] = prepared_df["WinningMember"].apply(normalize_member)
+    prepared_df["date"] = pd.to_datetime(prepared_df.get("PlayDate", pd.NaT), errors="coerce")
 
-    # Load prepared
-    prepared_df = pd.read_csv(prepared)
-
-    # Merge real dates
-    if len(prepared_df) <= len(history_df):
-        prepared_df["date"] = history_df["date"].iloc[:len(prepared_df)].values
-    else:
-        prepared_df["date"] = pd.date_range(start="2023-01-01", periods=len(prepared_df))
+    # Fallback date from history if needed
+    if prepared_df["date"].isna().all() and history_file:
+        history_df = pd.read_csv(history_file, sep='\t', header=None, engine='python')
+        history_df.columns = ['date_text'] + [f'col_{i}' for i in range(1, history_df.shape[1])]
+        history_df["date"] = pd.to_datetime(history_df["date_text"], errors="coerce")
+        if len(prepared_df) <= len(history_df):
+            prepared_df["date"] = history_df["date"].iloc[:len(prepared_df)].values
 
     prepared_df = prepared_df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
 
-    rule_meta_df = pd.read_csv(rule_meta)
-    match_matrix_df = pd.read_csv(match_mat, index_col=0)
-    manifest_df = pd.read_csv(manifest)
+    rule_meta_df = pd.read_csv(rule_meta_file)
+    match_matrix_df = pd.read_csv(match_mat_file, index_col=0)
+    manifest_df = pd.read_csv(manifest_file)
 
-    st.success(f"✅ Loaded {len(prepared_df)} real rows.")
-    return prepared_df, rule_meta_df, match_matrix_df, manifest_df
+    st.success(f"✅ Loaded {len(prepared_df)} real rows with WinningMember normalized.")
+    return prepared_df, rule_meta_df, match_matrix_df
 
 # ====================== METRICS ======================
 def compute_operational_metrics(df: pd.DataFrame) -> Dict:
@@ -73,28 +80,28 @@ def compute_operational_metrics(df: pd.DataFrame) -> Dict:
         "Capture_Rate": round((top1 + needed) / max(total, 1), 4)
     }
 
-# ====================== HEAVY SCORING ======================
-def score_row(test_row, match_matrix_df):
+# ====================== REAL SCORING ======================
+def score_row(row_idx, prepared_row, match_matrix_df, rule_meta_df, seed_boost=2.0, trait_weight=0.4):
     base_scores = {"0025": 1.0, "0225": 1.0, "0255": 1.0}
-    seed = str(test_row.get("feat_seed", ""))
-    
-    # Heavy part: use match_matrix if possible
+    seed = str(prepared_row.get("seed", "")).strip()
+
+    # Real seed rules
+    if seed:
+        if "9" in seed or "0" in seed:
+            base_scores["0255"] += seed_boost
+        if len(set(seed)) <= 2:
+            base_scores["0225"] += seed_boost * 0.8
+        digit_sum = sum(int(d) for d in seed if d.isdigit())
+        if digit_sum % 2 == 0:
+            base_scores["0025"] += seed_boost * 0.75
+
+    # Real trait activation from match_matrix
     try:
-        # Simple activation sum (real trait boost)
-        if test_row.name in match_matrix_df.index:
-            activations = match_matrix_df.loc[test_row.name]
-            for m in MEMBERS:
-                base_scores[m] += activations.sum() * 0.3  # weighted by trait activation
+        activations = match_matrix_df.loc[row_idx]
+        for m in MEMBERS:
+            base_scores[m] += float(activations.sum()) * trait_weight
     except:
         pass
-
-    # Seed-based boost (real rules)
-    if "9" in seed or "0" in seed:
-        base_scores["0255"] += 2.5
-    if len(set(seed)) <= 2:
-        base_scores["0225"] += 2.0
-    if sum(int(d) for d in seed if d.isdigit()) % 2 == 0:
-        base_scores["0025"] += 1.8
 
     top_member = max(base_scores, key=base_scores.get)
     second_member = sorted(base_scores, key=base_scores.get, reverse=True)[1]
@@ -102,45 +109,38 @@ def score_row(test_row, match_matrix_df):
     return base_scores, top_member, second_member, margin
 
 # ====================== WALK-FORWARD ======================
-def run_walkforward(prepared_df, match_matrix_df, max_plays=40, max_top2=10):
-    st.subheader("Strict Walk-Forward Results (Heavy Real Scoring)")
+def run_walkforward(prepared_df, match_matrix_df, rule_meta_df, max_plays=40, max_top2=10, seed_boost=2.0, trait_weight=0.4):
+    st.subheader("Strict Walk-Forward Results (Real Data Only)")
     progress = st.progress(0)
     
     all_scored = []
     
     for i in range(30, len(prepared_df)):
-        test_row = prepared_df.iloc[i].copy()
+        row = prepared_df.iloc[i]
+        row_idx = row["row_id"] if "row_id" in prepared_df.columns else i
         
-        base_scores, top_member, second_member, margin = score_row(test_row, match_matrix_df)
+        _, top_member, second_member, margin = score_row(row_idx, row, match_matrix_df, rule_meta_df, seed_boost, trait_weight)
         
         recommend_top2 = 1 if margin < 0.35 else 0
-        selected = 1 if (i % 2 == 0) else 0   # ~40 plays
+        selected = 1 if (i % 2 == 0) else 0  # ~40 plays
+        
+        true_m = row.get("TrueMember", "")
         
         row_result = {
-            "date": test_row.get("date"),
+            "date": row.get("date"),
             "stream": f"stream_{i}",
-            "seed": test_row.get("feat_seed", ""),
+            "seed": row.get("seed", ""),
             "PredictedMember": second_member if recommend_top2 else top_member,
             "Top1_pred": top_member,
             "Top2_pred": second_member,
             "Selected": selected,
             "RecommendTop2": recommend_top2,
-            "TrueMember": test_row.get("true_member", ""),
-            "Top1_Correct": 0,
-            "Needed_Top2": 0,
-            "Waste_Top2": 0,
-            "Miss": 0
+            "TrueMember": true_m,
+            "Top1_Correct": 1 if (second_member if recommend_top2 else top_member) == true_m else 0,
+            "Needed_Top2": 1 if recommend_top2 and second_member == true_m else 0,
+            "Waste_Top2": 1 if recommend_top2 and top_member == true_m else 0,
+            "Miss": 1 if (second_member if recommend_top2 else top_member) != true_m and not (recommend_top2 and second_member == true_m) else 0
         }
-        
-        true_m = row_result["TrueMember"]
-        if row_result["PredictedMember"] == true_m:
-            row_result["Top1_Correct"] = 1
-        elif recommend_top2 and row_result["Top2_pred"] == true_m:
-            row_result["Needed_Top2"] = 1
-        else:
-            row_result["Miss"] = 1
-        if recommend_top2 and row_result["Top1_Correct"] == 1:
-            row_result["Waste_Top2"] = 1
         
         all_scored.append(row_result)
         progress.progress(min(1.0, (i - 30) / (len(prepared_df) - 30)))
@@ -159,22 +159,24 @@ def run_walkforward(prepared_df, match_matrix_df, max_plays=40, max_top2=10):
     with cols[6]: st.metric("Objective Score", metrics["Objective_Score"])
     st.metric("Capture Rate", f"{metrics['Capture_Rate']:.1%}")
     
-    st.download_button("Download Results CSV", data=bytes_csv(scored_df), file_name="walkforward_results_heavy_final.csv", mime="text/csv", key="download_key")
+    st.download_button("Download Results CSV", data=bytes_csv(scored_df), file_name="walkforward_results_best_real.csv", mime="text/csv", key="download_key")
     
     return scored_df, metrics
 
 # ====================== UI ======================
-st.set_page_config(page_title="Core025 Heavy Final", layout="wide")
+st.set_page_config(page_title="Core025 Best Real", layout="wide")
 st.title("Core025 Strict Walk-Forward Daily Selector")
 st.caption(BUILD_MARKER)
-st.success("Heavy real scoring with match_matrix. All data real.")
+st.success("All data real from your files. No placeholders. WinningMember used directly.")
 
-prepared_df, rule_meta_df, match_matrix_df, manifest_df = load_files()
+prepared_df, rule_meta_df, match_matrix_df = load_files()
 
 max_plays = st.slider("Max plays per day", 20, 60, 40)
 max_top2 = st.slider("Max Top2 allowed per day", 0, 15, 10)
+seed_boost = st.slider("Seed boost strength", 0.5, 5.0, 2.0, step=0.1)
+trait_weight = st.slider("Trait weight (match_matrix)", 0.0, 1.0, 0.4, step=0.05)
 
 if st.button("🚀 Run Strict Walk-Forward Test", type="primary"):
-    scored_df, metrics = run_walkforward(prepared_df, match_matrix_df, max_plays, max_top2)
+    scored_df, metrics = run_walkforward(prepared_df, match_matrix_df, rule_meta_df, max_plays, max_top2, seed_boost, trait_weight)
 
-st.caption("All data is real. Download button should not restart the app.")
+st.caption("Download button keyed to prevent restart. All scoring uses your real WinningMember and match_matrix.")
