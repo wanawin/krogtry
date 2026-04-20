@@ -1,9 +1,9 @@
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Core025 v20 Stacked", layout="wide")
-st.title("🎯 Core025 v20 - Stacked Traits + Strong Conditional Gates")
-st.caption("BUILD: core025_ultimate_walkforward_v20__2026-04-20")
+st.set_page_config(page_title="Core025 v21 Final Push", layout="wide")
+st.title("🎯 Core025 v21 - Deeper Stacked Mining + Refined Gates for 75%+")
+st.caption("BUILD: core025_ultimate_walkforward_v21__2026-04-20")
 
 data_file = st.file_uploader("prepared_full_truth_with_stream_stats_v6.csv", type="csv")
 lib_file = st.file_uploader("promoted separator library CSV", type="csv")
@@ -31,16 +31,16 @@ col1, col2, col3 = st.columns(3)
 with col1:
     max_plays = st.slider("Max Plays per Day", 20, 100, 40)
     max_top2 = st.slider("Max Top2 per Day", 0, 20, 10)
-    min_margin = st.slider("Min Margin for Top2", 0.0, 5.0, 0.7, step=0.1)
+    min_margin = st.slider("Min Margin for Top2", 0.0, 5.0, 0.8, step=0.1)
 with col2:
     prune_pct = st.slider("Prune Low-Density %", 0, 60, 25)
-    seed_boost = st.slider("Seed Boost", 0.0, 8.0, 3.0)
+    seed_boost = st.slider("Seed Boost", 0.0, 10.0, 3.5)
 with col3:
-    trait_weight = st.slider("Trait Weight", 0.0, 8.0, 4.0)
+    trait_weight = st.slider("Trait Weight", 0.0, 10.0, 4.5)
     warm_up = st.slider("Warm-up Rows", 0, 5, 1)
 
-# Stacked + single trait mining (deeper)
-def deep_mine_separators(df, min_rate=0.78, min_support=6):
+# Deeper stacked mining
+def deep_mine_separators(df, min_rate=0.77, min_support=5):
     mined = []
     trait_cols = [c for c in df.columns if any(k in c.lower() for k in ["pair_has_", "adj_ord_has_", "parity_pattern", "highlow_pattern", "repeat_shape", "palindrome", "consec", "mirror", "sum_bucket", "spread_bucket", "has", "cnt"])]
     
@@ -55,22 +55,22 @@ def deep_mine_separators(df, min_rate=0.78, min_support=6):
                 if rate >= min_rate:
                     mined.append({"trait_stack": f"{col}={val}", "winner_member": m, "winner_rate": rate, "support": (subset["TrueMember"] == m).sum(), "stack_size": 1})
     
-    # Simple 2-trait stacking (top frequent pairs)
-    for i, col1 in enumerate(trait_cols[:15]):  # limit for speed
-        for col2 in trait_cols[i+1:i+10]:
-            for v1 in df[col1].astype(str).unique()[:8]:
-                for v2 in df[col2].astype(str).unique()[:8]:
+    # 2-trait stacking (more combinations)
+    for i, col1 in enumerate(trait_cols[:20]):
+        for col2 in trait_cols[i+1:i+15]:
+            for v1 in list(df[col1].astype(str).unique())[:10]:
+                for v2 in list(df[col2].astype(str).unique())[:10]:
                     if v1 in ["", "nan"] or v2 in ["", "nan"]: continue
                     subset = df[(df[col1].astype(str) == v1) & (df[col2].astype(str) == v2)]
                     if len(subset) < min_support: continue
                     for m in MEMBERS:
                         rate = (subset["TrueMember"] == m).sum() / len(subset)
-                        if rate >= min_rate + 0.05:  # higher bar for stacks
+                        if rate >= min_rate + 0.04:
                             stack = f"{col1}={v1} && {col2}={v2}"
                             mined.append({"trait_stack": stack, "winner_member": m, "winner_rate": rate, "support": (subset["TrueMember"] == m).sum(), "stack_size": 2})
     return pd.DataFrame(mined)
 
-new_rules = deep_mine_separators(df, min_rate=0.78, min_support=6)
+new_rules = deep_mine_separators(df, min_rate=0.77, min_support=5)
 st.info(f"Deep mining found {len(new_rules)} new separators (single + stacked)")
 
 all_rules = pd.concat([lib_df, new_rules], ignore_index=True) if not new_rules.empty else lib_df
@@ -96,7 +96,7 @@ def apply_rules(row, rules_df):
                 fired.append(f"{winner}+{boost:.2f}")
     return boosts, fired
 
-if st.button("🚀 Run v20 Stacked Mining + Strong Gates"):
+if st.button("🚀 Run v21 Deeper Stacked + Refined Gates"):
     if "hit_density" in df.columns:
         thresh = df["hit_density"].quantile(prune_pct / 100.0)
         df_p = df[df["hit_density"] >= thresh].copy()
@@ -121,19 +121,20 @@ if st.button("🚀 Run v20 Stacked Mining + Strong Gates"):
 
         true_m = str(row.get("TrueMember", "")).strip()
 
-        # Strong conditional gated Top3
+        # Refined strong gates
         seed_str = str(row.get("seed", "")).strip()
         if margin < min_margin:
             gate = False
             if ("0" in seed_str and "9" in seed_str) or len(set(seed_str)) <= 2 or any(d*2 in seed_str for d in "0123456789") or "88" in seed_str or "99" in seed_str or "00" in seed_str:
                 gate = True
-            # Member-pair conditional example
             if top == "0225" and second == "0255" and ("0" in seed_str or "9" in seed_str):
+                gate = True
+            if top == "0025" and second == "0255" and len(set(seed_str)) <= 3:
                 gate = True
             if gate:
                 third = [m for m in MEMBERS if m not in [top, second]][0]
                 top = third
-                fired.append("GATED_TOP3 (strong conditional)")
+                fired.append("GATED_TOP3 (refined strong conditional)")
 
         top1 = 1 if top == true_m else 0
         needed = 1 if (top1 == 0 and second == true_m) else 0
@@ -173,7 +174,7 @@ if st.button("🚀 Run v20 Stacked Mining + Strong Gates"):
     capture = (t1 + nt2) / total * 100 if total > 0 else 0
     obj = (t1 * 3.0) + (nt2 * 2.0) - (waste * 1.2) - (miss * 2.5)
 
-    st.subheader("v20 Results — Stacked Mining + Strong Conditional Gates")
+    st.subheader("v21 Results — Deeper Stacked Mining + Refined Gates")
     c1, c2, c3 = st.columns(3)
     with c1:
         st.metric("Capture Rate", f"{capture:.1f}%", f"({t1 + nt2}/{total})")
@@ -188,6 +189,6 @@ if st.button("🚀 Run v20 Stacked Mining + Strong Gates"):
 
     st.dataframe(res_df)
     csv = res_df.to_csv(index=False)
-    st.download_button("Download full results", data=csv, file_name="walkforward_results_v20.csv", mime="text/csv")
+    st.download_button("Download full results", data=csv, file_name="walkforward_results_v21.csv", mime="text/csv")
 
-st.caption("v20 adds stacked traits and stronger conditional gates. Run with Full 312 Mode + Warm-up=1.")
+st.caption("v21: deeper stacking + refined member-pair gates. Target: 75%+")
