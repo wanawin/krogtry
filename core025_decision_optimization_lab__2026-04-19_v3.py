@@ -1,28 +1,28 @@
 #!/usr/bin/env python3
-# BUILD: core025_ultimate_walkforward_heavy_v4__2026-04-19
+# BUILD: core025_ultimate_walkforward_v7__2026-04-19
 
 import pandas as pd
 import streamlit as st
 import numpy as np
 
-st.set_page_config(page_title="Core025 Ultimate v4", layout="wide")
-st.title("🎯 Core025 Ultimate Heavy Walk-Forward v4")
-st.caption("BUILD: core025_ultimate_walkforward_heavy_v4__2026-04-19 | Fixed TrueMember once and for all")
+st.set_page_config(page_title="Core025 Ultimate v7", layout="wide")
+st.title("🎯 Core025 Ultimate Walk-Forward v7")
+st.caption("BUILD: core025_ultimate_walkforward_v7__2026-04-19 | Direct WinningMember normalization")
 
-main_file = st.file_uploader("prepared_full_truth_with_stream_stats_v4.csv", type="csv", key="main")
-if not main_file:
+data_file = st.file_uploader("Upload prepared_full_truth_with_stream_stats_v6.csv (or any prepared file)", type="csv", key="data")
+if not data_file:
     st.stop()
 
-df = pd.read_csv(main_file)
+df = pd.read_csv(data_file)
 
-# ====================== ULTRA-STRONG NORMALIZATION ======================
-def normalize_true(x):
-    if pd.isna(x) or str(x).strip() == "": 
+# Strong normalization from the column that actually has data
+def normalize_win(x):
+    if pd.isna(x) or str(x).strip() == "":
         return ""
-    s = str(x).strip().replace(" ", "").replace("255", "0255").replace("25", "0025").replace("225", "0225")
-    if s in ["0025", "25", "025"]: return "0025"
-    if s in ["0225", "225"]: return "0225"
-    if s in ["0255", "255"]: return "0255"
+    s = str(x).strip().replace(" ", "")
+    if s in ["25", "0025", "025"]: return "0025"
+    if s in ["225", "0225"]: return "0225"
+    if s in ["255", "0255"]: return "0255"
     if s.isdigit():
         s = s.zfill(4)
         if s == "0025": return "0025"
@@ -30,25 +30,24 @@ def normalize_true(x):
         if s == "0255": return "0255"
     return s
 
-# Try multiple possible columns
-for col in ["TrueMember", "WinningMember", "winning_4digit", "TrueMember_text", "WinningMember_text"]:
-    if col in df.columns:
-        df["TrueMember"] = df[col].apply(normalize_true)
-        break
-
-st.success(f"✅ Loaded {len(df)} rows.")
-
-# Debug panel - this will show us exactly what the raw values were
-st.subheader("🔍 TrueMember Normalization Debug")
-st.write("Raw value counts before normalization:")
-if "TrueMember" in df.columns:
-    st.write(df["TrueMember"].value_counts())
+# Use WinningMember if present, otherwise TrueMember
+if "WinningMember" in df.columns:
+    df["TrueMember"] = df["WinningMember"].apply(normalize_win)
+elif "TrueMember" in df.columns:
+    df["TrueMember"] = df["TrueMember"].apply(normalize_win)
 else:
-    st.write("No TrueMember column found - using fallback.")
+    df["TrueMember"] = ""
+
+# Debug
+st.success(f"Loaded {len(df)} rows.")
+st.subheader("🔍 TrueMember Debug (Raw → Normalized)")
+if "WinningMember" in df.columns:
+    st.write("Raw WinningMember counts:", df["WinningMember"].value_counts().to_dict())
+st.write("Normalized TrueMember counts:", df["TrueMember"].value_counts().to_dict())
 
 MEMBERS = ["0025", "0225", "0255"]
 
-# Sliders (same as before)
+# Sliders
 col1, col2 = st.columns(2)
 with col1:
     max_plays = st.slider("Max Plays per Day", 20, 60, 40)
@@ -73,11 +72,11 @@ def score_row(row):
     sorted_scores = sorted(base.items(), key=lambda x: x[1], reverse=True)
     return sorted_scores[0][0], sorted_scores[1][0], sorted_scores[0][1] - sorted_scores[1][1]
 
-if st.button("🚀 Run Walk-Forward v4"):
+if st.button("🚀 Run Walk-Forward v7"):
     if "hit_density" in df.columns:
         thresh = df["hit_density"].quantile(prune_pct / 100.0)
         df_p = df[df["hit_density"] >= thresh].copy()
-        st.info(f"Pruned to {len(df_p)} rows (hit_density ≥ {thresh:.4f})")
+        st.info(f"Pruned to {len(df_p)} rows")
     else:
         df_p = df.copy()
     
@@ -130,17 +129,17 @@ if st.button("🚀 Run Walk-Forward v4"):
         st.metric("Objective", f"{obj:.1f}")
         st.metric("Plays/Win", f"{total/(t1+nt2) if (t1+nt2)>0 else total:.2f}")
     
-    st.dataframe(res_df.head(50))
+    st.dataframe(res_df)
     
     csv = res_df.to_csv(index=False)
     st.download_button(
-        "📥 Download walkforward_results_v4.csv",
+        "📥 Download walkforward_results_v7.csv",
         data=csv,
-        file_name="walkforward_results_v4.csv",
+        file_name="walkforward_results_v7.csv",
         mime="text/csv",
-        key="v4_stable_download"
+        key="v7_stable"
     )
     
-    st.success("Run complete. Download should no longer reset the app.")
+    st.success("Run complete.")
 
-st.caption("All data remains 100% real from your files.")
+st.caption("All data real. Normalization now uses the WinningMember column that actually has values.")
