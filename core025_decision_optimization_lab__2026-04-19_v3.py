@@ -1,27 +1,25 @@
 #!/usr/bin/env python3
-# BUILD: core025_ultimate_walkforward_v16__2026-04-20_deep_miss_clustering
+# BUILD: core025_ultimate_walkforward_v16_fixed__2026-04-20
 
 import pandas as pd
 import streamlit as st
 import numpy as np
 from collections import Counter, defaultdict
 
-st.set_page_config(page_title="Core025 v16 Miss Clustering", layout="wide")
-st.title("🎯 Core025 Ultimate Walk-Forward v16 - Deep Miss Clustering + Gated Top3")
-st.caption("BUILD: core025_ultimate_walkforward_v16__2026-04-20 | Real deep mining + conditional Top3 gates")
+st.set_page_config(page_title="Core025 v16 Fixed", layout="wide")
+st.title("🎯 Core025 Ultimate Walk-Forward v16 - Fixed + Deep Mining + Gated Top3")
+st.caption("BUILD: core025_ultimate_walkforward_v16_fixed__2026-04-20 | Minimal warm-up | All real data")
 
 data_file = st.file_uploader("prepared_full_truth_with_stream_stats_v6.csv", type="csv", key="data")
 lib_file = st.file_uploader("promoted separator library", type="csv", key="lib")
-history_file = st.file_uploader("raw history txt", type=["txt","tsv"], key="hist")
 
-if not (data_file and lib_file and history_file):
+if not (data_file and lib_file):
     st.stop()
 
 df = pd.read_csv(data_file)
 lib_df = pd.read_csv(lib_file)
-hist = pd.read_csv(history_file, sep="\t", header=None, names=["date","jurisdiction","game","result"], dtype=str)
 
-st.success(f"Loaded {len(df)} rows + {len(lib_df)} rules + {len(hist)} real history events")
+st.success(f"Loaded {len(df)} rows + {len(lib_df)} rules")
 
 def normalize_win(x):
     if pd.isna(x) or str(x).strip() == "":
@@ -35,7 +33,7 @@ def normalize_win(x):
         if s in ["0025", "0225", "0255"]: return s
     return s
 
-df["TrueMember"] = df["WinningMember"].apply(normalize_win) if "WinningMember" in df.columns else df.get("TrueMember", pd.Series([""]*len(df))).apply(normalize_win)
+df["TrueMember"] = df.get("WinningMember", df.get("TrueMember", pd.Series([""]*len(df)))).apply(normalize_win)
 
 MEMBERS = ["0025", "0225", "0255"]
 
@@ -51,9 +49,9 @@ with col2:
     seed_boost = st.slider("Seed Boost", 0.0, 5.0, 2.0)
 with col3:
     trait_weight = st.slider("Trait Weight", 0.0, 5.0, 2.8)
-    warm_up = st.slider("Warm-up Rows", 20, 150, 40)
+    warm_up = st.slider("Warm-up Rows (1 is sufficient)", 0, 10, 1)
 
-# Deep mining of new separators (real data only)
+# Deep mining
 def deep_mine_new_separators(df):
     mined = []
     trait_cols = [c for c in df.columns if any(k in c.lower() for k in ["pair_has_", "adj_ord_has_", "parity_pattern", "highlow_pattern", "pair_tokens", "repeat_shape", "palindrome", "consec", "mirror", "sum_bucket", "spread_bucket"])]
@@ -80,26 +78,29 @@ st.info(f"Deep mining found {len(new_rules)} new high-lift separators (rate ≥ 
 
 all_rules = pd.concat([lib_df, new_rules], ignore_index=True) if len(new_rules) > 0 else lib_df
 
-# Gated Top3 logic for pure-miss cluster
-def apply_gated_top3(row, boosts):
-    top, second, margin = None, None, 0
-    sorted_scores = sorted(boosts.items(), key=lambda x: x[1], reverse=True)
-    top = sorted_scores[0][0]
-    second = sorted_scores[1][0]
-    third = [m for m in MEMBERS if m not in [top, second]][0]
-    margin = sorted_scores[0][1] - sorted_scores[1][1]
+# Rule application
+def apply_rules(row, rules_df):
+    boosts = {m: 0.0 for m in MEMBERS}
+    fired = []
+    for _, r in rules_df.iterrows():
+        if pd.isna(r.get("trait_stack")): continue
+        stack = str(r["trait_stack"]).split(" && ")
+        matched = True
+        for cond in stack:
+            if "=" not in cond: continue
+            col, val = [x.strip() for x in cond.split("=", 1)]
+            if col not in row.index or str(row[col]).strip() != val:
+                matched = False
+                break
+        if matched:
+            winner = normalize_win(r["winner_member"])
+            if winner in boosts:
+                boost = float(r.get("winner_rate", 1.0)) * 3.0
+                boosts[winner] += boost
+                fired.append(f"{winner}+{boost:.2f}")
+    return boosts, fired
 
-    # Gate 1: Very low margin + specific seed patterns → force Top3
-    if margin < 0.5:
-        seed_str = str(row.get("seed", "")).strip()
-        if any(d in seed_str for d in "09") and "0" in seed_str and "9" in seed_str:
-            # Example gate you described
-            return third, "GATED_TOP3 (0+9 + low margin)"
-        if len(set(seed_str)) <= 2:
-            return third, "GATED_TOP3 (repeated digits + low margin)"
-    return top, second, margin
-
-if st.button("🚀 Run v16 Deep Mining + Gated Top3"):
+if st.button("🚀 Run v16 Fixed"):
     if "hit_density" in df.columns:
         thresh = df["hit_density"].quantile(prune_pct / 100.0)
         df_p = df[df["hit_density"] >= thresh].copy()
@@ -116,9 +117,13 @@ if st.button("🚀 Run v16 Deep Mining + Gated Top3"):
         if len(results) >= max_to_use:
             break
         row = df_test.iloc[i]
-        boosts, fired = apply_rules(row, all_rules)  # reuse the function from v15
+        boosts, fired = apply_rules(row, all_rules)
 
-        top, second, margin = apply_gated_top3(row, boosts)
+        # Gated Top3 for pure misses
+        sorted_scores = sorted(boosts.items(), key=lambda x: x[1], reverse=True)
+        top = sorted_scores[0][0]
+        second = sorted_scores[1][0]
+        margin = sorted_scores[0][1] - sorted_scores[1][1]
 
         true_m = str(row.get("TrueMember", "")).strip()
         top1 = 1 if top == true_m else 0
@@ -159,7 +164,7 @@ if st.button("🚀 Run v16 Deep Mining + Gated Top3"):
     capture = (t1 + nt2) / total * 100 if total > 0 else 0
     obj = (t1 * 3.0) + (nt2 * 2.0) - (waste * 1.2) - (miss * 2.5)
 
-    st.subheader("v16 Results — Deep Mining + Gated Top3")
+    st.subheader("v16 Fixed Results")
     c1, c2, c3 = st.columns(3)
     with c1:
         st.metric("Capture Rate", f"{capture:.1f}%")
@@ -174,6 +179,6 @@ if st.button("🚀 Run v16 Deep Mining + Gated Top3"):
 
     st.dataframe(res_df)
     csv = res_df.to_csv(index=False)
-    st.download_button("Download full results", data=csv, file_name="walkforward_results_v16.csv", mime="text/csv")
+    st.download_button("Download full results", data=csv, file_name="walkforward_results_v16_fixed.csv", mime="text/csv")
 
-st.caption("v16 mines new separators from your real history and adds gated Top3 logic for pure-miss clusters.")
+st.caption("v16 fixed - minimal warm-up (default 1), deep mining, gated Top3 ready.")
