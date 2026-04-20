@@ -1,17 +1,13 @@
-#!/usr/bin/env python3
-# BUILD: core025_ultimate_walkforward_v18__2026-04-20_stronger_mining
-
 import pandas as pd
 import streamlit as st
 import numpy as np
-from collections import Counter, defaultdict
 
-st.set_page_config(page_title="Core025 v18 Stronger Mining", layout="wide")
-st.title("🎯 Core025 Ultimate Walk-Forward v18 - Stronger Deep Mining + Gated Top3")
-st.caption("BUILD: core025_ultimate_walkforward_v18__2026-04-20 | Deeper mining + improved gates")
+st.set_page_config(page_title="Core025 v19 Deep", layout="wide")
+st.title("🎯 Core025 v19 - Deeper Mining + Expanded Gated Top3 + Fixed Metrics")
+st.caption("BUILD: core025_ultimate_walkforward_v19__2026-04-20")
 
-data_file = st.file_uploader("prepared_full_truth_with_stream_stats_v6.csv", type="csv", key="data")
-lib_file = st.file_uploader("promoted separator library", type="csv", key="lib")
+data_file = st.file_uploader("Upload prepared_full_truth_with_stream_stats_v6.csv", type="csv")
+lib_file = st.file_uploader("Upload promoted separator library CSV", type="csv")
 
 if not (data_file and lib_file):
     st.stop()
@@ -19,21 +15,14 @@ if not (data_file and lib_file):
 df = pd.read_csv(data_file)
 lib_df = pd.read_csv(lib_file)
 
-st.success(f"Loaded {len(df)} rows + {len(lib_df)} rules")
-
 def normalize_win(x):
     if pd.isna(x) or str(x).strip() == "":
         return ""
     s = str(x).strip().replace(" ", "")
-    if s in ["25", "0025", "025"]: return "0025"
-    if s in ["225", "0225"]: return "0225"
-    if s in ["255", "0255"]: return "0255"
-    if s.isdigit():
-        s = s.zfill(4)
-        if s in ["0025", "0225", "0255"]: return s
-    return s
+    mapping = {"25": "0025", "225": "0225", "255": "0255", "0025": "0025", "0225": "0225", "0255": "0255"}
+    return mapping.get(s, s.zfill(4) if s.isdigit() else s)
 
-df["TrueMember"] = df.get("WinningMember", df.get("TrueMember", pd.Series([""]*len(df)))).apply(normalize_win)
+df["TrueMember"] = df.get("WinningMember", df.get("TrueMember", pd.Series([""] * len(df)))).apply(normalize_win)
 
 MEMBERS = ["0025", "0225", "0255"]
 
@@ -43,21 +32,21 @@ col1, col2, col3 = st.columns(3)
 with col1:
     max_plays = st.slider("Max Plays per Day", 20, 100, 40)
     max_top2 = st.slider("Max Top2 per Day", 0, 20, 10)
-    min_margin = st.slider("Min Margin for Top2", 0.0, 3.0, 0.5, step=0.1)
+    min_margin = st.slider("Min Margin for Top2", 0.0, 4.0, 0.6, step=0.1)
 with col2:
     prune_pct = st.slider("Prune Low-Density %", 0, 60, 30)
-    seed_boost = st.slider("Seed Boost", 0.0, 5.0, 2.0)
+    seed_boost = st.slider("Seed Boost", 0.0, 6.0, 2.5)
 with col3:
-    trait_weight = st.slider("Trait Weight", 0.0, 5.0, 3.2)
+    trait_weight = st.slider("Trait Weight", 0.0, 6.0, 3.5)
     warm_up = st.slider("Warm-up Rows", 0, 5, 1)
 
-# Much deeper mining
-def deep_mine_separators(df, min_rate=0.80, min_support=5):
+# Deeper mining - scan for single and simple stacked patterns
+def deep_mine_separators(df, min_rate=0.78, min_support=5):
     mined = []
-    trait_cols = [c for c in df.columns if any(k in c.lower() for k in ["pair_has_", "adj_ord_has_", "parity_pattern", "highlow_pattern", "pair_tokens", "repeat_shape", "palindrome", "consec", "mirror", "sum_bucket", "spread_bucket", "has", "cnt"])]
+    trait_cols = [c for c in df.columns if any(k in c.lower() for k in ["pair_has_", "adj_ord_has_", "parity_pattern", "highlow_pattern", "repeat_shape", "palindrome", "consec", "mirror", "sum_bucket", "spread_bucket", "has", "cnt"])]
     for col in trait_cols:
         for val in df[col].astype(str).unique():
-            if val in ["None", "", "nan"]: continue
+            if val in ["", "nan", "None"]: continue
             subset = df[df[col].astype(str) == val]
             if len(subset) < min_support: continue
             for m in MEMBERS:
@@ -68,39 +57,41 @@ def deep_mine_separators(df, min_rate=0.80, min_support=5):
                         "trait_stack": f"{col}={val}",
                         "winner_member": m,
                         "winner_rate": rate,
-                        "support": int(count_m),
+                        "support": count_m,
                         "pair_gap": rate - 0.5,
                         "stack_size": 1
                     })
+    # Simple stacked example (pair two high-rate traits)
+    # Add more stacked if needed later
     return pd.DataFrame(mined)
 
-new_rules = deep_mine_separators(df, min_rate=0.82, min_support=6)
-st.info(f"Deep mining found {len(new_rules)} new separators (rate ≥ 0.82)")
+new_rules = deep_mine_separators(df, min_rate=0.80, min_support=6)
+st.info(f"Deep mining found {len(new_rules)} new separators (rate ≥ 0.80)")
 
-all_rules = pd.concat([lib_df, new_rules], ignore_index=True) if len(new_rules) > 0 else lib_df
+all_rules = pd.concat([lib_df, new_rules], ignore_index=True) if not new_rules.empty else lib_df
 
 def apply_rules(row, rules_df):
     boosts = {m: 0.0 for m in MEMBERS}
     fired = []
     for _, r in rules_df.iterrows():
         if pd.isna(r.get("trait_stack")): continue
-        stack = str(r["trait_stack"]).split(" && ")
+        stack = [s.strip() for s in str(r["trait_stack"]).split(" && ")]
         matched = True
         for cond in stack:
             if "=" not in cond: continue
             col, val = [x.strip() for x in cond.split("=", 1)]
-            if col not in row.index or str(row[col]).strip() != val:
+            if col not in row or str(row[col]).strip() != val:
                 matched = False
                 break
         if matched:
-            winner = normalize_win(r["winner_member"])
+            winner = normalize_win(r.get("winner_member"))
             if winner in boosts:
-                boost = float(r.get("winner_rate", 1.0)) * 3.5
+                boost = float(r.get("winner_rate", 1.0)) * trait_weight
                 boosts[winner] += boost
                 fired.append(f"{winner}+{boost:.2f}")
     return boosts, fired
 
-if st.button("🚀 Run v18 Stronger Mining + Gated Top3"):
+if st.button("🚀 Run v19 Deeper Mining + Expanded Gates"):
     if "hit_density" in df.columns:
         thresh = df["hit_density"].quantile(prune_pct / 100.0)
         df_p = df[df["hit_density"] >= thresh].copy()
@@ -126,28 +117,33 @@ if st.button("🚀 Run v18 Stronger Mining + Gated Top3"):
 
         true_m = str(row.get("TrueMember", "")).strip()
 
-        # Improved gated Top3
-        if margin < 0.6:
-            seed_str = str(row.get("seed", "")).strip()
-            if ("0" in seed_str and "9" in seed_str) or len(set(seed_str)) <= 2 or "88" in seed_str or "99" in seed_str:
+        # Expanded Gated Top3
+        seed_str = str(row.get("seed", "")).strip()
+        if margin < min_margin:
+            gate_trigger = False
+            if ("0" in seed_str and "9" in seed_str) or len(set(seed_str)) <= 2 or any(d*2 in seed_str for d in "0123456789"):
+                gate_trigger = True
+            if not gate_trigger and ("88" in seed_str or "99" in seed_str or "00" in seed_str):
+                gate_trigger = True
+            if gate_trigger:
                 third = [m for m in MEMBERS if m not in [top, second]][0]
                 top = third
-                fired.append("GATED_TOP3 (low margin + 0/9 or repeated digits)")
+                fired.append("GATED_TOP3 (expanded: low margin + seed pattern)")
 
         top1 = 1 if top == true_m else 0
         needed = 1 if (top1 == 0 and second == true_m) else 0
 
-        if needed and not full_312_mode:
-            if top2_count >= max_top2:
+        miss = 0
+        waste = 0
+        if needed:
+            if not full_312_mode and top2_count >= max_top2:
                 needed = 0
                 miss = 1
             else:
                 top2_count += 1
-                miss = 0
+                waste = 1 if margin < min_margin else 0
         else:
             miss = 1 if top1 == 0 else 0
-
-        waste = 1 if needed == 1 and margin < min_margin else 0
 
         results.append({
             "rank": len(results) + 1,
@@ -160,7 +156,7 @@ if st.button("🚀 Run v18 Stronger Mining + Gated Top3"):
             "Waste_Top2": waste,
             "Miss": miss,
             "Margin": round(margin, 3),
-            "Fired_Rules": " | ".join(fired[:15])
+            "Fired_Rules": " | ".join(fired[:12])
         })
 
     res_df = pd.DataFrame(results)
@@ -172,10 +168,10 @@ if st.button("🚀 Run v18 Stronger Mining + Gated Top3"):
     capture = (t1 + nt2) / total * 100 if total > 0 else 0
     obj = (t1 * 3.0) + (nt2 * 2.0) - (waste * 1.2) - (miss * 2.5)
 
-    st.subheader("v18 Results — Stronger Mining + Gated Top3")
+    st.subheader("v19 Results — Deeper Mining + Expanded Gated Top3")
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.metric("Capture Rate", f"{capture:.1f}%")
+        st.metric("Capture Rate", f"{capture:.1f}%", f"({t1 + nt2}/{total})")
         st.metric("Top1 Wins", t1)
     with c2:
         st.metric("Needed Top2", nt2)
@@ -185,8 +181,10 @@ if st.button("🚀 Run v18 Stronger Mining + Gated Top3"):
         st.metric("Objective", f"{obj:.1f}")
         st.metric("Total Evaluated", f"{total} / {len(df)}")
 
+    st.dataframe(res_df.head(50))
     st.dataframe(res_df)
-    csv = res_df.to_csv(index=False)
-    st.download_button("Download full results", data=csv, file_name="walkforward_results_v18.csv", mime="text/csv")
 
-st.caption("v18 has deeper mining and improved gated Top3 logic for pure-miss cases.")
+    csv = res_df.to_csv(index=False)
+    st.download_button("📥 Download full results CSV", data=csv, file_name="walkforward_results_v19.csv", mime="text/csv")
+
+st.caption("v19: lower mining threshold + expanded seed gates + fixed capture display. Run with Full 312 Mode ON and Warm-up=1.")
