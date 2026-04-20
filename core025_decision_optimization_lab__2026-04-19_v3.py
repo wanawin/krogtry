@@ -2,9 +2,9 @@ import pandas as pd
 import streamlit as st
 from collections import defaultdict
 
-st.set_page_config(page_title="Core025 v23 Per-Seed Baselines", layout="wide")
-st.title("🎯 Core025 v23 - Per-Seed Baselines + Deep Stacked Mining")
-st.caption("BUILD: core025_ultimate_walkforward_v23__2026-04-20 | Per-seed baselines for higher capture")
+st.set_page_config(page_title="Core025 v24 Tuned Baselines", layout="wide")
+st.title("🎯 Core025 v24 - Tuned Per-Seed Baselines + Strong Traits")
+st.caption("BUILD: core025_ultimate_walkforward_v24__2026-04-20 | Fixed blending")
 
 data_file = st.file_uploader("prepared_full_truth_with_stream_stats_v6.csv", type="csv")
 lib_file = st.file_uploader("promoted separator library CSV", type="csv")
@@ -35,12 +35,13 @@ with col1:
     min_margin = st.slider("Min Margin for Top2", 0.0, 6.0, 1.0, step=0.1)
 with col2:
     prune_pct = st.slider("Prune Low-Density %", 0, 60, 20)
-    seed_boost = st.slider("Seed Boost", 0.0, 12.0, 4.5)
+    seed_boost = st.slider("Seed Boost", 0.0, 12.0, 4.0)
 with col3:
-    trait_weight = st.slider("Trait Weight", 0.0, 12.0, 5.5)
+    trait_weight = st.slider("Trait Weight", 0.0, 12.0, 5.0)
+    baseline_weight = st.slider("Baseline Weight (0 = off)", 0.0, 3.0, 0.8, step=0.1)
     warm_up = st.slider("Warm-up Rows", 0, 5, 1)
 
-# Deep stacked mining (same as v22 but slightly more aggressive)
+# Deep stacked mining (same strong version as before)
 def deep_mine_separators(df, min_rate=0.76, min_support=5):
     mined = []
     trait_cols = [c for c in df.columns if any(k in c.lower() for k in ["pair_has_", "adj_ord_has_", "parity_pattern", "highlow_pattern", "repeat_shape", "palindrome", "consec", "mirror", "sum_bucket", "spread_bucket", "has", "cnt"])]
@@ -97,7 +98,7 @@ def apply_rules(row, rules_df):
                 fired.append(f"{winner}+{boost:.2f}")
     return boosts, fired
 
-if st.button("🚀 Run v23 Per-Seed Baselines + Deep Mining"):
+if st.button("🚀 Run v24 Tuned Per-Seed Baselines"):
     if "hit_density" in df.columns:
         thresh = df["hit_density"].quantile(prune_pct / 100.0)
         df_p = df[df["hit_density"] >= thresh].copy()
@@ -106,7 +107,7 @@ if st.button("🚀 Run v23 Per-Seed Baselines + Deep Mining"):
 
     df_test = df_p.iloc[warm_up:].copy()
 
-    # Per-seed baseline maps (incremental, no lookahead)
+    # Per-seed baseline (smoothed, incremental)
     seed_history = defaultdict(lambda: {m: 0 for m in MEMBERS})
     seed_count = defaultdict(int)
 
@@ -115,23 +116,22 @@ if st.button("🚀 Run v23 Per-Seed Baselines + Deep Mining"):
     max_to_use = len(df_test) if full_312_mode else max_plays
 
     for i in range(len(df_test)):
-        if len(results) >= max_to_use:
-            break
+        if len(results) >= max_to_use: break
         row = df_test.iloc[i]
         seed = str(row.get("seed", "")).strip()
 
-        # Get current baseline for this seed
+        # Baseline boost (only if enough history)
         baseline = seed_history[seed]
-        total_for_seed = seed_count[seed]
-        baseline_boost = {m: (baseline[m] / total_for_seed * 3.0) if total_for_seed > 0 else 0.0 for m in MEMBERS}
+        total = seed_count[seed]
+        baseline_boost = {m: (baseline[m] / total * baseline_weight) if total >= 3 else 0.0 for m in MEMBERS}
 
-        # Trait-based scoring
+        # Trait scoring
         trait_boosts, fired = apply_rules(row, all_rules)
 
-        # Combine: trait + seed baseline + seed_boost
+        # Final combined score
         final_scores = {}
         for m in MEMBERS:
-            final_scores[m] = trait_boosts.get(m, 0.0) + baseline_boost.get(m, 0.0) + (seed_boost if any(d in seed for d in "09") and m == "0255" else 0)
+            final_scores[m] = trait_boosts.get(m, 0.0) + baseline_boost.get(m, 0.0)
 
         sorted_scores = sorted(final_scores.items(), key=lambda x: x[1], reverse=True)
         top = sorted_scores[0][0]
@@ -140,7 +140,7 @@ if st.button("🚀 Run v23 Per-Seed Baselines + Deep Mining"):
 
         true_m = str(row.get("TrueMember", "")).strip()
 
-        # Aggressive gated Top3
+        # Strong gated Top3
         seed_str = seed
         if margin < min_margin:
             gate = False
@@ -153,7 +153,7 @@ if st.button("🚀 Run v23 Per-Seed Baselines + Deep Mining"):
             if gate:
                 third = [m for m in MEMBERS if m not in [top, second]][0]
                 top = third
-                fired.append("GATED_TOP3 (aggressive + baseline)")
+                fired.append("GATED_TOP3 (strong)")
 
         top1 = 1 if top == true_m else 0
         needed = 1 if (top1 == 0 and second == true_m) else 0
@@ -184,7 +184,7 @@ if st.button("🚀 Run v23 Per-Seed Baselines + Deep Mining"):
             "Fired_Rules": " | ".join(fired[:20])
         })
 
-        # Update baseline for next rows (no lookahead)
+        # Update baseline (no lookahead)
         if true_m in seed_history[seed]:
             seed_history[seed][true_m] += 1
             seed_count[seed] += 1
@@ -198,7 +198,7 @@ if st.button("🚀 Run v23 Per-Seed Baselines + Deep Mining"):
     capture = (t1 + nt2) / total * 100 if total > 0 else 0
     obj = (t1 * 3.0) + (nt2 * 2.0) - (waste * 1.2) - (miss * 2.5)
 
-    st.subheader("v23 Results — Per-Seed Baselines + Deep Stacked Mining")
+    st.subheader("v24 Results — Tuned Per-Seed Baselines")
     c1, c2, c3 = st.columns(3)
     with c1:
         st.metric("Capture Rate", f"{capture:.1f}%", f"({t1 + nt2}/{total})")
@@ -213,6 +213,6 @@ if st.button("🚀 Run v23 Per-Seed Baselines + Deep Mining"):
 
     st.dataframe(res_df)
     csv = res_df.to_csv(index=False)
-    st.download_button("Download full results", data=csv, file_name="walkforward_results_v23.csv", mime="text/csv")
+    st.download_button("Download full results", data=csv, file_name="walkforward_results_v24.csv", mime="text/csv")
 
-st.caption("v23 adds incremental per-seed baseline maps. This should push capture higher by learning seed-specific patterns.")
+st.caption("v24: baseline_weight slider + smoother blending. Use 0.6–1.2 for best results.")
