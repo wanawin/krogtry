@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-# BUILD: core025_ultimate_walkforward_v17__2026-04-20_miss_clustering_gated_top3
+# BUILD: core025_ultimate_walkforward_v18__2026-04-20_stronger_mining
 
 import pandas as pd
 import streamlit as st
 import numpy as np
 from collections import Counter, defaultdict
 
-st.set_page_config(page_title="Core025 v17 Miss Clustering", layout="wide")
-st.title("🎯 Core025 Ultimate Walk-Forward v17 - Miss Clustering + Gated Top3")
-st.caption("BUILD: core025_ultimate_walkforward_v17__2026-04-20 | Deep miss clustering + conditional Top3")
+st.set_page_config(page_title="Core025 v18 Stronger Mining", layout="wide")
+st.title("🎯 Core025 Ultimate Walk-Forward v18 - Stronger Deep Mining + Gated Top3")
+st.caption("BUILD: core025_ultimate_walkforward_v18__2026-04-20 | Deeper mining + improved gates")
 
 data_file = st.file_uploader("prepared_full_truth_with_stream_stats_v6.csv", type="csv", key="data")
 lib_file = st.file_uploader("promoted separator library", type="csv", key="lib")
@@ -43,38 +43,39 @@ col1, col2, col3 = st.columns(3)
 with col1:
     max_plays = st.slider("Max Plays per Day", 20, 100, 40)
     max_top2 = st.slider("Max Top2 per Day", 0, 20, 10)
-    min_margin = st.slider("Min Margin for Top2", 0.0, 3.0, 0.5, step=0.1)  # lowered a bit
+    min_margin = st.slider("Min Margin for Top2", 0.0, 3.0, 0.5, step=0.1)
 with col2:
     prune_pct = st.slider("Prune Low-Density %", 0, 60, 30)
     seed_boost = st.slider("Seed Boost", 0.0, 5.0, 2.0)
 with col3:
-    trait_weight = st.slider("Trait Weight", 0.0, 5.0, 3.0)
+    trait_weight = st.slider("Trait Weight", 0.0, 5.0, 3.2)
     warm_up = st.slider("Warm-up Rows", 0, 5, 1)
 
-# Deep mining + miss cluster mining
-def deep_mine_separators(df):
+# Much deeper mining
+def deep_mine_separators(df, min_rate=0.80, min_support=5):
     mined = []
-    trait_cols = [c for c in df.columns if any(k in c.lower() for k in ["pair_has_", "adj_ord_has_", "parity_pattern", "highlow_pattern", "pair_tokens", "repeat_shape", "palindrome", "consec", "mirror", "sum_bucket", "spread_bucket"])]
+    trait_cols = [c for c in df.columns if any(k in c.lower() for k in ["pair_has_", "adj_ord_has_", "parity_pattern", "highlow_pattern", "pair_tokens", "repeat_shape", "palindrome", "consec", "mirror", "sum_bucket", "spread_bucket", "has", "cnt"])]
     for col in trait_cols:
         for val in df[col].astype(str).unique():
             if val in ["None", "", "nan"]: continue
             subset = df[df[col].astype(str) == val]
-            if len(subset) < 6: continue
+            if len(subset) < min_support: continue
             for m in MEMBERS:
-                rate = (subset["TrueMember"] == m).sum() / len(subset)
-                if rate >= 0.82:
+                count_m = (subset["TrueMember"] == m).sum()
+                rate = count_m / len(subset)
+                if rate >= min_rate:
                     mined.append({
                         "trait_stack": f"{col}={val}",
                         "winner_member": m,
                         "winner_rate": rate,
-                        "support": int((subset["TrueMember"] == m).sum()),
+                        "support": int(count_m),
                         "pair_gap": rate - 0.5,
                         "stack_size": 1
                     })
     return pd.DataFrame(mined)
 
-new_rules = deep_mine_separators(df)
-st.info(f"Deep mining found {len(new_rules)} new separators")
+new_rules = deep_mine_separators(df, min_rate=0.82, min_support=6)
+st.info(f"Deep mining found {len(new_rules)} new separators (rate ≥ 0.82)")
 
 all_rules = pd.concat([lib_df, new_rules], ignore_index=True) if len(new_rules) > 0 else lib_df
 
@@ -94,12 +95,12 @@ def apply_rules(row, rules_df):
         if matched:
             winner = normalize_win(r["winner_member"])
             if winner in boosts:
-                boost = float(r.get("winner_rate", 1.0)) * 3.2
+                boost = float(r.get("winner_rate", 1.0)) * 3.5
                 boosts[winner] += boost
                 fired.append(f"{winner}+{boost:.2f}")
     return boosts, fired
 
-if st.button("🚀 Run v17 Miss Clustering + Gated Top3"):
+if st.button("🚀 Run v18 Stronger Mining + Gated Top3"):
     if "hit_density" in df.columns:
         thresh = df["hit_density"].quantile(prune_pct / 100.0)
         df_p = df[df["hit_density"] >= thresh].copy()
@@ -125,10 +126,10 @@ if st.button("🚀 Run v17 Miss Clustering + Gated Top3"):
 
         true_m = str(row.get("TrueMember", "")).strip()
 
-        # Gated Top3 for pure miss cluster
-        if margin < 0.6:  # low separation
+        # Improved gated Top3
+        if margin < 0.6:
             seed_str = str(row.get("seed", "")).strip()
-            if ("0" in seed_str and "9" in seed_str) or len(set(seed_str)) <= 2:
+            if ("0" in seed_str and "9" in seed_str) or len(set(seed_str)) <= 2 or "88" in seed_str or "99" in seed_str:
                 third = [m for m in MEMBERS if m not in [top, second]][0]
                 top = third
                 fired.append("GATED_TOP3 (low margin + 0/9 or repeated digits)")
@@ -159,7 +160,7 @@ if st.button("🚀 Run v17 Miss Clustering + Gated Top3"):
             "Waste_Top2": waste,
             "Miss": miss,
             "Margin": round(margin, 3),
-            "Fired_Rules": " | ".join(fired[:12])
+            "Fired_Rules": " | ".join(fired[:15])
         })
 
     res_df = pd.DataFrame(results)
@@ -171,7 +172,7 @@ if st.button("🚀 Run v17 Miss Clustering + Gated Top3"):
     capture = (t1 + nt2) / total * 100 if total > 0 else 0
     obj = (t1 * 3.0) + (nt2 * 2.0) - (waste * 1.2) - (miss * 2.5)
 
-    st.subheader("v17 Results — Miss Clustering + Gated Top3")
+    st.subheader("v18 Results — Stronger Mining + Gated Top3")
     c1, c2, c3 = st.columns(3)
     with c1:
         st.metric("Capture Rate", f"{capture:.1f}%")
@@ -184,8 +185,8 @@ if st.button("🚀 Run v17 Miss Clustering + Gated Top3"):
         st.metric("Objective", f"{obj:.1f}")
         st.metric("Total Evaluated", f"{total} / {len(df)}")
 
-    st.dataframe(res_df.head(100))
+    st.dataframe(res_df)
     csv = res_df.to_csv(index=False)
-    st.download_button("Download full results", data=csv, file_name="walkforward_results_v17.csv", mime="text/csv")
+    st.download_button("Download full results", data=csv, file_name="walkforward_results_v18.csv", mime="text/csv")
 
-st.caption("v17 uses minimal warm-up and adds gated Top3 for pure-miss clusters with low margin + specific seed patterns.")
+st.caption("v18 has deeper mining and improved gated Top3 logic for pure-miss cases.")
