@@ -1,31 +1,39 @@
-# BUILD: core025_correction_library_builder__2026-04-21_v1
+# BUILD: core025_combined_library_builder__2026-04-21_v8_FULL_APP
 
+import streamlit as st
 import pandas as pd
 from itertools import combinations
 from collections import Counter
 
-# ================================
-# LOAD FULL TRUTH FILE
-# ================================
+st.set_page_config(layout="wide")
 
-def load_truth(file_path):
-    df = pd.read_csv(file_path)
+st.title("Core025 Combined Library Builder (v8)")
 
-    required = ["WinningMember", "Top1_actual", "Top2_actual"]
-    for col in required:
-        if col not in df.columns:
-            raise ValueError(f"Missing required column: {col}")
+st.markdown("""
+Upload:
+1. FULL TRUTH file (required)
+2. Existing separator library (optional)
 
-    return df
+This will generate a COMBINED library usable in your main app.
+""")
 
 # ================================
-# FEATURE EXTRACTION
+# FILE INPUTS
 # ================================
 
-def extract_basic_traits(row):
+truth_file = st.file_uploader("Upload FULL TRUTH file (.csv or .txt)", type=["csv","txt"])
+separator_file = st.file_uploader("Upload existing separator library (optional)", type=["csv"])
+
+min_support = st.slider("Min support", 3, 20, 5)
+min_winrate = st.slider("Min win rate", 0.5, 0.9, 0.55)
+
+# ================================
+# TRAIT EXTRACTION
+# ================================
+
+def extract_traits(row):
     traits = []
 
-    # Example traits (extendable)
     if "seed_sum" in row:
         traits.append(f"seed_sum_{int(row['seed_sum'])}")
 
@@ -41,38 +49,26 @@ def extract_basic_traits(row):
     return traits
 
 # ================================
-# BUILD CORRECTION EVENTS
+# BUILD CORRECTION LIBRARY
 # ================================
 
-def build_correction_events(df):
-    rows = []
+def build_correction(df):
+
+    events = []
 
     for _, r in df.iterrows():
 
-        # misranking condition
-        top1 = r["Top1_actual"]
-        top2 = r["Top2_actual"]
-        winner = r["WinningMember"]
-
-        if pd.isna(top1) or pd.isna(top2) or pd.isna(winner):
+        if pd.isna(r.get("Top1_actual")) or pd.isna(r.get("Top2_actual")) or pd.isna(r.get("WinningMember")):
             continue
 
-        traits = extract_basic_traits(r)
+        if r["Top1_actual"] != r["WinningMember"] and r["Top2_actual"] == r["WinningMember"]:
 
-        # Only care about misranking
-        if top1 != winner and top2 == winner:
-            rows.append({
+            traits = extract_traits(r)
+
+            events.append({
                 "traits": traits,
-                "winner": winner
+                "winner": r["WinningMember"]
             })
-
-    return rows
-
-# ================================
-# STACK TRAITS
-# ================================
-
-def build_trait_stacks(events, min_support=5):
 
     counter = {}
 
@@ -80,21 +76,17 @@ def build_trait_stacks(events, min_support=5):
         traits = e["traits"]
         winner = e["winner"]
 
-        # single + combos
         for k in range(1, min(4, len(traits)+1)):
             for combo in combinations(traits, k):
+
                 key = tuple(sorted(combo))
 
                 if key not in counter:
-                    counter[key] = {
-                        "count": 0,
-                        "winners": Counter()
-                    }
+                    counter[key] = {"count": 0, "winners": Counter()}
 
                 counter[key]["count"] += 1
                 counter[key]["winners"][winner] += 1
 
-    # build final rules
     rules = []
 
     for k, v in counter.items():
@@ -106,8 +98,7 @@ def build_trait_stacks(events, min_support=5):
         winner_member, win_count = v["winners"].most_common(1)[0]
         win_rate = win_count / support
 
-        # only strong correction signals
-        if win_rate < 0.55:
+        if win_rate < min_winrate:
             continue
 
         rules.append({
@@ -123,34 +114,54 @@ def build_trait_stacks(events, min_support=5):
     return pd.DataFrame(rules)
 
 # ================================
-# SAVE LIBRARY
-# ================================
-
-def save_library(df, name="core025_correction_library.csv"):
-    df.to_csv(name, index=False)
-    print(f"Saved: {name}")
-    return name
-
-# ================================
-# MAIN
-# ================================
-
-def build_correction_library(file_path):
-    df = load_truth(file_path)
-    events = build_correction_events(df)
-    rules = build_trait_stacks(events)
-
-    if len(rules) == 0:
-        print("WARNING: No correction rules found.")
-    else:
-        print(f"Generated {len(rules)} correction rules")
-
-    return save_library(rules)
-
-
-# ================================
 # RUN
 # ================================
 
-if __name__ == "__main__":
-    build_correction_library("prepared_full_truth_with_stream_stats_v6.csv")
+if st.button("BUILD COMBINED LIBRARY"):
+
+    if truth_file is None:
+        st.error("Upload FULL TRUTH file first")
+        st.stop()
+
+    try:
+        df_truth = pd.read_csv(truth_file)
+    except:
+        df_truth = pd.read_csv(truth_file, sep="\t")
+
+    st.success(f"Loaded truth file: {len(df_truth)} rows")
+
+    # Build correction rules
+    correction_df = build_correction(df_truth)
+
+    st.write(f"Correction rules generated: {len(correction_df)}")
+
+    # Load separator if present
+    if separator_file is not None:
+        sep_df = pd.read_csv(separator_file)
+        st.write(f"Separator rules loaded: {len(sep_df)}")
+
+        combined = pd.concat([sep_df, correction_df], ignore_index=True)
+    else:
+        combined = correction_df
+
+    st.write(f"Final combined rules: {len(combined)}")
+
+    st.dataframe(combined.head(20))
+
+    # ================================
+    # DOWNLOADS
+    # ================================
+
+    st.download_button(
+        "Download COMBINED library CSV",
+        combined.to_csv(index=False),
+        file_name="core025_combined_library.csv",
+        mime="text/csv"
+    )
+
+    st.download_button(
+        "Download COMBINED library TXT",
+        combined.to_csv(index=False),
+        file_name="core025_combined_library.txt",
+        mime="text/plain"
+    )
