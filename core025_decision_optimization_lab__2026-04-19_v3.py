@@ -48,4 +48,4 @@ df["ThirdMember"] = df.apply(get_third, axis=1)
 # -----------------------------
 # TOP3 RESCUE LOGIC (MEASURED)
 # -----------------------------
-danger_rows = {2, 14, 30, 50
+danger_rows = {2, 14, 30, 50}
