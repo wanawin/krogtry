@@ -1,0 +1,3356 @@
+#!/usr/bin/env python3
+# BUILD: core025_northern_lights__2026-05-01_v59_GUARDED_STRAIGHT_ELIMINATION
+
+from __future__ import annotations
+
+import io
+import hashlib
+import re
+import zipfile
+from itertools import permutations
+from typing import Dict, List, Tuple, Optional
+
+import pandas as pd
+import streamlit as st
+
+BUILD_MARKER = "BUILD: core025_northern_lights__2026-05-01_v59_GUARDED_STRAIGHT_ELIMINATION"
+
+# v55 fixed production defaults
+V55_PRODUCTION_STREAM_DEPTH = 12
+V55_BEST_STRAIGHTS_PER_STREAM = 3
+V55_OPTIONAL_STRAIGHT_DEPTH = 6
+V55_MIN_RULE_HITS = 2
+V55_MIN_RULE_CONF = 30
+V55_MIN_RULE_LIFT = 1.5
+V55_MEMBER_WEIGHT = 20.0
+V55_DOUBLE_WEIGHT = 30.0
+V55_POSITION_WEIGHT = 25.0
+V55_STACK_WEIGHT = 1.0
+V55_MAX_STACK_BOOST = 60.0
+V59_ENABLE_STRAIGHT_ELIMINATION = True
+V59_MIN_ELIMINATION_SUPPORT = 2
+V59_MEMBER_KEEP_TOP_N = 2
+V59_DOUBLE_POSITION_KEEP_TOP_N = 3
+V59_PERM_STACK_KEEP_TOP_N = 12
+V59_ELIMINATION_MAX_REMOVE_PCT_PER_STREAM = 0.75
+
+MEMBERS = ["0025", "0225", "0255"]
+
+st.set_page_config(page_title="Core025 Northern Lights 025", layout="wide")
+st.title("Core025 Northern Lights — 025 Live + Lab")
+st.caption(BUILD_MARKER)
+st.warning(
+    "025-only merged build v50: final optimized row play-type model, corrected Top3 gating, optimized Top2 cost control, row-by-row percentile scoring, and stream-reduction method tests; v44 scoring preserved, "
+    "Northern-Lights-style stream reduction, and v22/v31 truth-backed member engine."
+)
+st.caption("v59 production: v58 defaults preserved; adds guarded straight elimination before ranking using embedded mined reports.")
+
+for k in [
+    "daily_playlist", "lab_results", "lab_summary", "stream_diag",
+    "truth_rules", "loaded_meta", "percentile_df", "stream_method_tests", "row_single_perf", "row_play_model", "straight_playlist", "straight_summary", "straight_backtest_results", "straight_backtest_summary", "straight_backtest_rankdist", "lab_results_all_events", "lab_summary_all_events"
+]:
+    if k not in st.session_state:
+        st.session_state[k] = None
+
+
+def load_upload(uploaded_file, header: Optional[int] = "infer") -> pd.DataFrame:
+    raw = uploaded_file.getvalue()
+    name = uploaded_file.name.lower()
+
+    if name.endswith(".csv"):
+        return pd.read_csv(io.BytesIO(raw), dtype=str)
+
+    if name.endswith(".txt") or name.endswith(".tsv"):
+        try:
+            df = pd.read_csv(io.BytesIO(raw), sep="\t", dtype=str)
+            if df.shape[1] >= 4:
+                return df
+        except Exception:
+            pass
+        return pd.read_csv(io.BytesIO(raw), sep="\t", header=None, dtype=str)
+
+    raise ValueError(f"Unsupported file type: {uploaded_file.name}")
+
+
+def _file_hash(raw: bytes) -> str:
+    return hashlib.sha256(raw or b"").hexdigest()
+
+
+@st.cache_data(show_spinner=False)
+def cached_load_upload_bytes(raw: bytes, file_name: str) -> pd.DataFrame:
+    """Cached parser keyed by bytes + filename. Auto-invalidates when uploaded file contents change."""
+    class _CachedUpload:
+        def __init__(self, data: bytes, name: str):
+            self._data = data
+            self.name = name
+        def getvalue(self):
+            return self._data
+    return load_upload(_CachedUpload(raw, file_name)).copy()
+
+
+@st.cache_data(show_spinner=False)
+def cached_normalize_history_bytes(raw: bytes, file_name: str) -> pd.DataFrame:
+    return normalize_history(cached_load_upload_bytes(raw, file_name)).copy()
+
+
+@st.cache_data(show_spinner=False)
+def cached_load_truth_bytes(raw: bytes, file_name: str) -> pd.DataFrame:
+    return ensure_truth(cached_load_upload_bytes(raw, file_name)).copy()
+
+
+@st.cache_data(show_spinner=False)
+def cached_load_library_bytes(raw: bytes, file_name: str) -> pd.DataFrame:
+    return ensure_library(pd.read_csv(io.BytesIO(raw), dtype=str)).copy()
+
+
+def uploaded_file_meta(uploaded_file) -> Dict[str, object]:
+    if uploaded_file is None:
+        return {"loaded": False, "name": "", "bytes": 0, "sha256": "", "rows": 0, "last_date": ""}
+    raw = uploaded_file.getvalue()
+    return {
+        "loaded": True,
+        "name": uploaded_file.name,
+        "bytes": len(raw),
+        "sha256": _file_hash(raw),
+    }
+
+
+def combine_history_with_optional_24h(hist_base: pd.DataFrame, hist_24h: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Combine full history and optional 24h history safely.
+
+    The 24h file is optional. If present, it is appended after the full file and wins duplicate
+    conflicts on the same StreamKey + Date. This prevents stale full-history rows from overriding
+    newly uploaded daily results.
+    """
+    if hist_base is None or hist_base.empty:
+        return pd.DataFrame()
+    combined = hist_base.copy()
+    if hist_24h is not None and not hist_24h.empty:
+        combined = pd.concat([combined, hist_24h.copy()], ignore_index=True)
+    combined["Date"] = pd.to_datetime(combined["Date"], errors="coerce")
+    combined = combined[combined["Date"].notna()].copy()
+    combined["_merge_order"] = range(len(combined))
+    dedupe_cols = ["StreamKey", "Date"]
+    combined = combined.sort_values(dedupe_cols + ["_merge_order"]).drop_duplicates(subset=dedupe_cols, keep="last")
+    combined = combined.drop(columns=["_merge_order"]).sort_values(["StreamKey", "Date"]).reset_index(drop=True)
+    return combined
+
+
+def dataset_meta(df: pd.DataFrame) -> Dict[str, object]:
+    if df is None or df.empty:
+        return {"rows": 0, "streams": 0, "last_date": "UNKNOWN", "first_date": "UNKNOWN"}
+    dates = pd.to_datetime(df["Date"], errors="coerce")
+    return {
+        "rows": int(len(df)),
+        "streams": int(df["StreamKey"].nunique()) if "StreamKey" in df.columns else 0,
+        "first_date": str(dates.min().date()) if dates.notna().any() else "UNKNOWN",
+        "last_date": str(dates.max().date()) if dates.notna().any() else "UNKNOWN",
+    }
+
+
+def extract_pick4_digits(x) -> str:
+    if x is None:
+        return ""
+    s = str(x)
+    m = re.search(r"(\d)\D+(\d)\D+(\d)\D+(\d)", s)
+    if m:
+        return "".join(m.groups())
+    m2 = re.search(r"(?<!\d)(\d{4})(?!\d)", s)
+    if m2:
+        return m2.group(1)
+    digits = re.findall(r"\d", s)
+    if len(digits) >= 4:
+        return "".join(digits[:4])
+    return ""
+
+
+def box_key(s: str) -> str:
+    s = extract_pick4_digits(s) or str(s)
+    return "".join(sorted(re.sub(r"\D", "", s).zfill(4)[-4:]))
+
+
+def normalize_member(x) -> str:
+    if x is None:
+        return ""
+    s = str(x).strip().replace("'", "")
+    s = re.sub(r"\D", "", s)
+    if s in {"25", "025", "0025"}:
+        return "0025"
+    if s in {"225", "0225"}:
+        return "0225"
+    if s in {"255", "0255"}:
+        return "0255"
+    return s.zfill(4) if s else ""
+
+
+def result_to_core025_member(result4: str) -> str:
+    b = box_key(result4)
+    return b if b in set(MEMBERS) else ""
+
+
+def canonical_stream(state: str, game: str) -> str:
+    return f"{str(state).strip()} | {str(game).strip()}"
+
+
+def normalize_history(df_raw: pd.DataFrame) -> pd.DataFrame:
+    df = df_raw.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    lower = {c.lower(): c for c in df.columns}
+    if all(k in lower for k in ["date", "state", "game"]):
+        date_col = lower["date"]
+        state_col = lower["state"]
+        game_col = lower["game"]
+        result_col = None
+        for cand in ["results", "result", "winning numbers", "winning_numbers", "winningnumbers"]:
+            if cand in lower:
+                result_col = lower[cand]
+                break
+        if result_col is None and df.shape[1] >= 4:
+            result_col = df.columns[3]
+        if result_col is None:
+            raise ValueError("History file needs a Results/Result column.")
+        out = df[[date_col, state_col, game_col, result_col]].copy()
+        out.columns = ["Date", "State", "Game", "Results"]
+    else:
+        if df.shape[1] < 4:
+            raise ValueError("History file must have at least 4 columns: Date, State, Game, Results.")
+        out = df.iloc[:, :4].copy()
+        out.columns = ["Date", "State", "Game", "Results"]
+
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
+    out["Result"] = out["Results"].apply(extract_pick4_digits)
+    out = out[out["Date"].notna() & out["Result"].str.len().eq(4)].copy()
+    out["Box"] = out["Result"].apply(box_key)
+    out["StreamKey"] = out.apply(lambda r: canonical_stream(r["State"], r["Game"]), axis=1)
+    out["Core025Member"] = out["Result"].apply(result_to_core025_member)
+    out = out.sort_values(["StreamKey", "Date"]).reset_index(drop=True)
+    return out
+
+
+def ensure_truth(df_raw: pd.DataFrame) -> pd.DataFrame:
+    df = df_raw.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    if "WinningMember" in df.columns:
+        df["TrueMember"] = df["WinningMember"].apply(normalize_member)
+    elif "TrueMember" in df.columns:
+        df["TrueMember"] = df["TrueMember"].apply(normalize_member)
+    else:
+        raise ValueError("FULL TRUTH file must contain WinningMember or TrueMember.")
+
+    if "seed" not in df.columns:
+        for cand in ["PrevSeed", "feat_seed", "Seed"]:
+            if cand in df.columns:
+                df["seed"] = df[cand].astype(str)
+                break
+    if "seed" not in df.columns:
+        df["seed"] = ""
+
+    return df
+
+
+def ensure_library(df_raw: pd.DataFrame) -> pd.DataFrame:
+    df = df_raw.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    required = ["trait_stack", "winner_member", "winner_rate", "support", "stack_size"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Promoted separator library missing required columns: {missing}")
+    df["winner_member"] = df["winner_member"].apply(normalize_member)
+    df["winner_rate"] = pd.to_numeric(df["winner_rate"], errors="coerce").fillna(0.0)
+    return df
+
+
+def digits4(seed: str) -> List[int]:
+    s = extract_pick4_digits(seed)
+    if len(s) != 4:
+        s = re.sub(r"\D", "", str(seed)).zfill(4)[-4:]
+    return [int(ch) for ch in s] if len(s) == 4 else [0, 0, 0, 0]
+
+
+def repeat_shape(d: List[int]) -> str:
+    counts = sorted(pd.Series(d).value_counts().tolist(), reverse=True)
+    if counts == [1, 1, 1, 1]:
+        return "all_unique"
+    if counts == [2, 1, 1]:
+        return "one_pair"
+    if counts == [2, 2]:
+        return "two_pair"
+    if counts == [3, 1]:
+        return "triple"
+    if counts == [4]:
+        return "quad"
+    return "other"
+
+
+def structure_4(d: List[int]) -> str:
+    counts = sorted(pd.Series(d).value_counts().tolist(), reverse=True)
+    if counts == [4]:
+        return "AAAA"
+    if counts == [3, 1]:
+        return "AAAB"
+    if counts == [2, 2]:
+        return "AABB"
+    if counts == [2, 1, 1]:
+        return "AABC"
+    return "ABCD"
+
+
+def sum_bucket(v: int) -> str:
+    if v <= 13:
+        return "sum_10_13"
+    if v <= 17:
+        return "sum_14_17"
+    if v <= 21:
+        return "sum_18_21"
+    return "sum_22_plus"
+
+
+def spread_bucket(v: int) -> str:
+    if v <= 2:
+        return "spread_0_2"
+    if v <= 4:
+        return "spread_3_4"
+    if v <= 6:
+        return "spread_5_6"
+    return "spread_7_plus"
+
+
+def consec_links_count(d: List[int]) -> int:
+    u = sorted(set(d))
+    return sum(1 for a, b in zip(u, u[1:]) if b - a == 1)
+
+
+def enrich_seed_features(df: pd.DataFrame, seed_col: str = "seed") -> pd.DataFrame:
+    out = df.copy()
+    if seed_col not in out.columns:
+        out[seed_col] = ""
+
+    ds = out[seed_col].apply(digits4)
+    sums = [sum(d) for d in ds]
+    spreads = [max(d) - min(d) for d in ds]
+
+    out["seed_sum"] = sums
+    out["seed_spread"] = spreads
+    out["seed_even_cnt"] = [sum(1 for x in d if x % 2 == 0) for d in ds]
+    out["seed_high_cnt"] = [sum(1 for x in d if x >= 5) for d in ds]
+    out["seed_low_cnt"] = [sum(1 for x in d if x <= 4) for d in ds]
+    out["seed_has9"] = [1 if 9 in d else 0 for d in ds]
+    out["seed_has0"] = [1 if 0 in d else 0 for d in ds]
+    out["seed_parity_pattern"] = ["".join("E" if x % 2 == 0 else "O" for x in d) for d in ds]
+    out["seed_highlow_pattern"] = ["".join("H" if x >= 5 else "L" for x in d) for d in ds]
+    out["seed_repeat_shape"] = [repeat_shape(d) for d in ds]
+    out["seed"] = out[seed_col].astype(str).apply(lambda x: extract_pick4_digits(x) or re.sub(r"\D", "", str(x)).zfill(4)[-4:])
+
+    # Critical compatibility layer for the promoted separator library.
+    # The promoted library uses unprefixed trait names like cnt0, has0, high, low,
+    # parity_pattern, highlow_pattern, structure, sum_bucket, spread_bucket.
+    # These are generated from the current seed so daily and lab rule matching actually fires.
+    for digit in range(10):
+        out[f"cnt{digit}"] = [d.count(digit) for d in ds]
+        out[f"has{digit}"] = [1 if digit in d else 0 for d in ds]
+
+    out["even"] = out["seed_even_cnt"]
+    out["odd"] = [4 - int(v) for v in out["seed_even_cnt"]]
+    out["high"] = out["seed_high_cnt"]
+    out["low"] = out["seed_low_cnt"]
+    out["parity_pattern"] = out["seed_parity_pattern"]
+    out["highlow_pattern"] = out["seed_highlow_pattern"]
+    out["structure"] = [structure_4(d) for d in ds]
+    out["unique"] = [len(set(d)) for d in ds]
+    out["max_rep"] = [max(pd.Series(d).value_counts().tolist()) for d in ds]
+    out["consec_links"] = [consec_links_count(d) for d in ds]
+    out["pair"] = [1 if max(pd.Series(d).value_counts().tolist()) >= 2 else 0 for d in ds]
+    out["sum_bucket"] = [sum_bucket(int(v)) for v in sums]
+    out["spread_bucket"] = [spread_bucket(int(v)) for v in spreads]
+
+    return out
+
+
+def deep_mine_separators(df: pd.DataFrame, min_rate: float = 0.76, min_support: int = 5) -> pd.DataFrame:
+    mined: List[Dict] = []
+    trait_cols = [
+        c for c in df.columns
+        if any(k in c.lower() for k in [
+            "pair_has_", "adj_ord_has_", "parity_pattern", "highlow_pattern",
+            "repeat_shape", "palindrome", "consec", "mirror", "sum_bucket",
+            "spread_bucket", "has", "cnt", "seed_sum", "seed_spread"
+        ])
+    ]
+
+    for col in trait_cols:
+        vals = df[col].astype(str).fillna("").unique()
+        for val in vals:
+            if val in ["", "nan", "None"]:
+                continue
+            subset = df[df[col].astype(str) == val]
+            if len(subset) < min_support:
+                continue
+            for m in MEMBERS:
+                rate = (subset["TrueMember"] == m).sum() / len(subset)
+                if rate >= min_rate:
+                    mined.append({
+                        "pair": "TRUTH_MINED",
+                        "trait_stack": f"{col}={val}",
+                        "winner_member": m,
+                        "winner_rate": rate,
+                        "support": int((subset["TrueMember"] == m).sum()),
+                        "pair_gap": 0.0,
+                        "stack_size": 1,
+                    })
+
+    for i, col1 in enumerate(trait_cols[:25]):
+        for col2 in trait_cols[i + 1:i + 20]:
+            vals1 = list(df[col1].astype(str).fillna("").unique())[:12]
+            vals2 = list(df[col2].astype(str).fillna("").unique())[:12]
+            for v1 in vals1:
+                for v2 in vals2:
+                    if v1 in ["", "nan"] or v2 in ["", "nan"]:
+                        continue
+                    subset = df[(df[col1].astype(str) == v1) & (df[col2].astype(str) == v2)]
+                    if len(subset) < min_support:
+                        continue
+                    for m in MEMBERS:
+                        rate = (subset["TrueMember"] == m).sum() / len(subset)
+                        if rate >= min_rate + 0.05:
+                            mined.append({
+                                "pair": "TRUTH_MINED",
+                                "trait_stack": f"{col1}={v1} && {col2}={v2}",
+                                "winner_member": m,
+                                "winner_rate": rate,
+                                "support": int((subset["TrueMember"] == m).sum()),
+                                "pair_gap": 0.0,
+                                "stack_size": 2,
+                            })
+
+    if not mined:
+        return pd.DataFrame(columns=["pair", "trait_stack", "winner_member", "winner_rate", "support", "pair_gap", "stack_size"])
+    return pd.DataFrame(mined).drop_duplicates(subset=["trait_stack", "winner_member"]).reset_index(drop=True)
+
+
+def _val_equal(a, b) -> bool:
+    sa = str(a).strip()
+    sb = str(b).strip()
+    if sa == sb:
+        return True
+    try:
+        fa = float(sa)
+        fb = float(sb)
+        return abs(fa - fb) < 1e-9
+    except Exception:
+        return False
+
+
+def apply_rules(row: pd.Series, rules_df: pd.DataFrame, trait_weight: float) -> Tuple[Dict[str, float], List[str]]:
+    boosts = {m: 0.0 for m in MEMBERS}
+    fired: List[str] = []
+
+    for _, r in rules_df.iterrows():
+        stack_text = str(r.get("trait_stack", ""))
+        if not stack_text or stack_text.lower() == "nan":
+            continue
+
+        # Support both current promoted-library format "a=b && c=d"
+        # and older pipe-delimited stacked formats.
+        stack = [s.strip() for s in re.split(r"\s*&&\s*|\|", stack_text) if s.strip()]
+        matched = True
+
+        for cond in stack:
+            if "=" not in cond:
+                matched = False
+                break
+            col, val = [x.strip() for x in cond.split("=", 1)]
+            if col not in row.index or not _val_equal(row.get(col, ""), val):
+                matched = False
+                break
+
+        if matched:
+            winner = normalize_member(r.get("winner_member"))
+            if winner in boosts:
+                boost = float(r.get("winner_rate", 1.0)) * trait_weight
+                boosts[winner] += boost
+                fired.append(f"{winner}+{boost:.2f}:{stack_text}")
+    return boosts, fired
+
+
+def v22_pick(
+    row: pd.Series,
+    rules_df: pd.DataFrame,
+    trait_weight: float,
+    min_margin: float,
+    enable_margin_swap: bool = False,
+    top2_zone_ratio: float = 0.90,
+    top2_zone_margin: float = 5.0,
+    top2_risk_threshold: int = 3,
+) -> Dict:
+    """
+    v39 decision layer:
+    - Preserve v34/v36 scoring and strict score ranking.
+    - Top1 is highest score; Top2 is second-highest score.
+    - No third-choice hijack.
+    - FIRST gate: evaluate deep Top2-risk traits only if row is already in a Top2 zone.
+    """
+    boosts, fired = apply_rules(row, rules_df, trait_weight)
+    sorted_scores = sorted(boosts.items(), key=lambda x: x[1], reverse=True)
+
+    top = sorted_scores[0][0]
+    second = sorted_scores[1][0]
+    margin = float(sorted_scores[0][1]) - float(sorted_scores[1][1])
+    top1_score = float(sorted_scores[0][1])
+    top2_score = float(sorted_scores[1][1])
+    ratio = (top2_score / top1_score) if top1_score > 0 else 0.0
+    seed = str(row.get("seed", ""))
+
+    margin_swap = 0
+    if enable_margin_swap and margin < float(min_margin):
+        danger_seed = (
+            ("0" in seed and "9" in seed)
+            or len(set(seed)) <= 2
+            or "00" in seed
+            or "88" in seed
+            or "99" in seed
+        )
+        if danger_seed:
+            top, second = second, top
+            margin_swap = 1
+            fired.append("MARGIN_SWAP_TOP1_TOP2_ONLY")
+
+    is_top2_zone = (ratio >= float(top2_zone_ratio)) or (margin <= float(top2_zone_margin))
+
+    risk_score = 0
+    risk_reasons = []
+
+    if is_top2_zone:
+        if ratio >= float(top2_zone_ratio):
+            risk_score += 3
+            risk_reasons.append("ratio>=zone")
+
+        if margin <= float(top2_zone_margin):
+            risk_score += 3
+            risk_reasons.append("margin<=zone")
+
+        if (
+            str(row.get("sum_bucket", "")) == "sum_22_plus"
+            and str(row.get("spread_bucket", "")) == "spread_3_4"
+            and int(float(row.get("seed_has9", 0) or 0)) == 0
+        ):
+            risk_score += 2
+            risk_reasons.append("sum22_spread34_no9")
+
+        if (
+            top == "0255"
+            and str(row.get("structure", "")) == "AABC"
+            and int(float(row.get("seed_has9", 0) or 0)) == 1
+        ):
+            risk_score += 2
+            risk_reasons.append("0255_AABC_has9")
+
+        score_pair = f"{top}>{second}"
+        if (
+            score_pair == "0225>0255"
+            and str(row.get("sum_bucket", "")) == "sum_10_13"
+            and int(float(row.get("consec_links", 0) or 0)) == 1
+        ):
+            risk_score += 2
+            risk_reasons.append("0225_0255_sum10_consec1")
+
+        if (
+            str(row.get("parity_pattern", "")) == "EOOO"
+            and int(float(row.get("pair", 0) or 0)) == 1
+        ):
+            risk_score += 1
+            risk_reasons.append("EOOO_pair")
+
+        if (
+            str(row.get("highlow_pattern", "")) == "HLLH"
+            and int(float(row.get("seed_has0", 0) or 0)) == 0
+        ):
+            risk_score += 1
+            risk_reasons.append("HLLH_no0")
+
+    top2_decision = "TOP2_REQUIRED" if (is_top2_zone and risk_score >= int(top2_risk_threshold)) else "TOP1_SAFE"
+
+    return {
+        "PredictedMember": top,
+        "Top2_pred": second,
+        "Margin": round(margin, 3),
+        "Top2ToTop1Ratio": round(ratio, 4),
+        "Top2Zone": int(is_top2_zone),
+        "Top2RiskScore": int(risk_score),
+        "Top2Decision": top2_decision,
+        "Top2RiskReasons": "|".join(risk_reasons),
+        "DecisionMode": "STRICT_SCORE_RANK" if margin_swap == 0 else "MARGIN_SWAP_TOP1_TOP2_ONLY",
+        "MarginSwap": margin_swap,
+        "Fired_Rules": " | ".join(fired[:20]),
+        "GATED_TOP3": 0,
+        "score_0025": boosts["0025"],
+        "score_0225": boosts["0225"],
+        "score_0255": boosts["0255"],
+    }
+
+
+def build_live_seed_rows(hist: pd.DataFrame, top_streams: Optional[List[str]] = None) -> pd.DataFrame:
+    rows = []
+    # v49.5: history lookback is applied once at the component level before this function.
+    # Do not reference an undefined local/global lookback variable here.
+    if hist is None or hist.empty:
+        return pd.DataFrame()
+    hist = hist.copy()
+    hist["Date"] = pd.to_datetime(hist["Date"], errors="coerce")
+    hist = hist[hist["Date"].notna()].copy()
+    for stream, g in hist.groupby("StreamKey"):
+        g = g.sort_values("Date")
+        if g.empty:
+            continue
+        last = g.iloc[-1]
+        rows.append({
+            "StreamKey": stream,
+            "Date": last["Date"],
+            "seed": last["Result"],
+            "LastResult": last["Result"],
+            "State": last["State"],
+            "Game": last["Game"],
+        })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    if top_streams is not None:
+        out = out[out["StreamKey"].isin(top_streams)].copy()
+    return enrich_seed_features(out, "seed")
+
+
+def build_lab_event_rows(hist: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for stream, g in hist.groupby("StreamKey"):
+        g = g.sort_values("Date").reset_index(drop=True)
+        for i in range(1, len(g)):
+            true_member = result_to_core025_member(g.loc[i, "Result"])
+            if true_member:
+                rows.append({
+                    "StreamKey": stream,
+                    "Date": g.loc[i, "Date"],
+                    "seed": g.loc[i - 1, "Result"],
+                    "TrueMember": true_member,
+                    "Result": g.loc[i, "Result"],
+                })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return enrich_seed_features(out, "seed")
+
+
+def stream_reduction(hist: pd.DataFrame, window_days: int, prune_pct: int) -> Tuple[pd.DataFrame, List[str]]:
+    max_date = hist["Date"].max()
+    cutoff = max_date - pd.Timedelta(days=int(window_days))
+    win = hist[hist["Date"] >= cutoff].copy()
+    grp = win.groupby("StreamKey").agg(
+        draws=("Result", "size"),
+        core025_hits=("Core025Member", lambda s: int((s != "").sum())),
+        last_date=("Date", "max"),
+    ).reset_index()
+    grp["hit_density"] = grp["core025_hits"] / grp["draws"].replace(0, pd.NA)
+    grp["hit_density"] = grp["hit_density"].fillna(0.0)
+    thresh = grp["hit_density"].quantile(prune_pct / 100.0) if len(grp) else 0.0
+    grp["kept"] = (grp["hit_density"] >= thresh).astype(int)
+    grp["rank"] = grp["hit_density"].rank(ascending=False, method="first").astype(int)
+    grp["StreamRank"] = grp["rank"]
+    grp = grp.sort_values(["kept", "hit_density", "core025_hits"], ascending=[False, False, False]).reset_index(drop=True)
+    kept_streams = grp[grp["kept"] == 1]["StreamKey"].tolist()
+    return grp, kept_streams
+
+def assign_stream_tiers(stream_df: pd.DataFrame) -> pd.DataFrame:
+    out = stream_df.copy()
+    if out.empty:
+        return out
+    n = len(out)
+    out = out.sort_values(["StreamRank"], ascending=True).reset_index(drop=True)
+    out["RowPercentile"] = ((out["StreamRank"] / n) * 100).round(2)
+    out["SingleRow"] = out["StreamRank"].astype(int)
+    out["RowBucket10"] = (((out["StreamRank"] - 1) // max(1, int(n / 10))) + 1).clip(1, 10)
+    out["StreamTier"] = pd.cut(
+        out["RowPercentile"],
+        bins=[-0.01, 25, 50, 75, 100],
+        labels=["A_TOP25", "B_26_50", "C_51_75", "D_76_100"],
+    ).astype(str)
+    return out
+
+
+
+
+FALLBACK_ROW_PLAY_COUNTS = {
+    1:(6,2,3,0),2:(9,3,4,2),3:(4,2,1,1),4:(6,4,2,0),5:(7,4,2,0),
+    6:(7,4,3,0),7:(5,1,3,1),8:(4,1,2,0),9:(4,3,1,0),10:(5,3,2,0),
+    11:(3,1,2,0),12:(3,2,1,0),13:(1,1,0,0),14:(8,2,5,1),15:(4,1,2,0),
+    16:(2,2,0,0),17:(5,2,1,2),18:(3,2,1,0),19:(3,1,2,0),20:(4,1,2,1),
+    21:(5,2,2,1),22:(2,0,1,1),23:(3,3,0,0),24:(12,6,3,3),25:(5,4,0,1),
+    26:(5,3,1,0),27:(2,0,1,0),28:(4,3,0,1),29:(5,1,3,0),30:(9,2,5,2),
+    31:(1,0,1,0),32:(6,3,2,1),33:(4,1,3,0),34:(6,4,2,0),35:(2,0,2,0),
+    36:(4,3,1,0),37:(3,1,2,0),38:(2,1,0,1),39:(2,1,0,1),41:(5,4,0,1),
+    42:(3,0,3,0),43:(3,1,2,0),44:(4,1,1,2),45:(4,2,1,0),46:(3,1,2,0),
+    47:(5,2,3,0),48:(2,2,0,0),49:(2,1,1,0),50:(6,0,4,2),51:(3,1,1,1),
+    52:(5,3,1,1),53:(2,2,0,0),54:(1,1,0,0),55:(9,6,2,1),56:(6,2,1,3),
+    57:(2,0,1,1),58:(6,4,0,2),59:(1,0,1,0),60:(6,3,2,1),62:(4,3,1,0),
+    63:(2,2,0,0),64:(5,3,1,0),65:(6,5,0,0),66:(6,2,3,1),67:(3,2,1,0),
+    68:(3,1,2,0),69:(7,5,1,1),70:(2,2,0,0),71:(4,2,1,1),72:(2,0,1,0),
+    73:(1,0,1,0),74:(4,2,2,0),75:(2,1,1,0),76:(5,2,3,0),78:(3,2,1,0),
+}
+
+
+def build_row_play_model(single_row_perf: Optional[pd.DataFrame], min_hits: int, top3_threshold: float, top2_threshold: float, top1_threshold: float, low_top2_threshold: float = 0.35) -> pd.DataFrame:
+    source_rows = []
+    if single_row_perf is not None and not single_row_perf.empty:
+        for _, r in single_row_perf.iterrows():
+            try:
+                source_rows.append((int(r["SingleRow"]), int(r["rows"]), int(r["top1"]), int(r["top2_captured"]), int(r["top3_captured"])))
+            except Exception:
+                continue
+    else:
+        source_rows = [(k, *v) for k, v in FALLBACK_ROW_PLAY_COUNTS.items()]
+
+    rows = []
+    for row_num, total, top1, top2, top3 in source_rows:
+        if total <= 0:
+            continue
+
+        top1_rate = top1 / total
+        top2_rate = top2 / total
+        top3_rate = top3 / total
+        row_volatility = top2_rate + top3_rate
+
+        # v46 stability upgrade:
+        # - Restore protection on volatile rows that v45 trimmed too aggressively.
+        # - Keep Top3 controlled: it still requires historical row support.
+        # - Suppress Top2 only when Top1 is truly dominant and the row is not volatile.
+        if total < int(min_hits):
+            play_type = "TOP1_TOP2"
+            reason = "LOW_SAMPLE_CONSERVATIVE"
+        elif total >= int(min_hits) and top3 > 0 and top3_rate >= float(top3_threshold):
+            play_type = "TOP1_TOP2_TOP3"
+            reason = "ROW_TOP3_RATE_V46_CONTROLLED"
+        elif total >= int(min_hits) and top3 > 0 and row_volatility >= 0.50 and top2_rate >= 0.20:
+            play_type = "TOP1_TOP2_TOP3"
+            reason = "V46_VOLATILE_ROW_TOP3_PROTECT"
+        elif row_volatility >= 0.50:
+            play_type = "TOP1_TOP2"
+            reason = "V46_HIGH_VOLATILITY_TOP2_PROTECT"
+        elif (
+            top2_rate < float(low_top2_threshold)
+            and top1_rate >= float(top1_threshold)
+            and row_volatility < 0.40
+        ):
+            play_type = "TOP1_ONLY"
+            reason = "V46_STRONG_TOP1_SUPPRESS_TOP2"
+        elif top2_rate >= float(top2_threshold) and top2 >= top1:
+            play_type = "TOP1_TOP2"
+            reason = "ROW_TOP2_HEAVY"
+        elif top1_rate >= float(top1_threshold) and top2 == 0 and top3 == 0:
+            play_type = "TOP1_ONLY"
+            reason = "ROW_TOP1_DOMINANT"
+        else:
+            play_type = "TOP1_TOP2"
+            reason = "ROW_DEFAULT_TOP2"
+
+        rows.append({
+            "SingleRow": row_num,
+            "RowModelHits": total,
+            "RowModelTop1": top1,
+            "RowModelTop2": top2,
+            "RowModelTop3": top3,
+            "RowTop1Rate": round(top1_rate, 4),
+            "RowTop2Rate": round(top2_rate, 4),
+            "RowTop3Rate": round(top3_rate, 4),
+            "RowVolatilityRate": round(row_volatility, 4),
+            "RowLowTop2Threshold": float(low_top2_threshold),
+            "RowPlayType": play_type,
+            "RowPlayTypeReason": reason,
+        })
+    return pd.DataFrame(rows).sort_values("SingleRow").reset_index(drop=True)
+
+
+def apply_row_playtype_model(df: pd.DataFrame, row_model_df: Optional[pd.DataFrame], enabled: bool) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        return out
+    if not enabled or row_model_df is None or row_model_df.empty or "SingleRow" not in out.columns:
+        out["RowPlayType"] = ""
+        out["RowPlayTypeReason"] = "row_model_disabled"
+        return out
+
+    cols = ["SingleRow","RowModelHits","RowModelTop1","RowModelTop2","RowModelTop3","RowTop1Rate","RowTop2Rate","RowTop3Rate","RowVolatilityRate","RowLowTop2Threshold","RowPlayType","RowPlayTypeReason"]
+    out = out.merge(row_model_df[cols], on="SingleRow", how="left")
+    out["RowPlayType"] = out["RowPlayType"].fillna("TOP1_TOP2")
+    out["RowPlayTypeReason"] = out["RowPlayTypeReason"].fillna("row_unseen_default_top2")
+    out["PlayType"] = out["RowPlayType"]
+    return out
+
+
+def add_rare_top3_and_universal_scores(
+    df: pd.DataFrame,
+    enable_top3_rescue: bool,
+    top3_rescue_min_score: int,
+    w_model: float,
+    w_row: float,
+    w_density: float,
+    w_outlier: float,
+) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        return out
+
+    # Third member = the omitted member from the strict Top1/Top2 pair.
+    def _third(row):
+        top1 = str(row.get("PredictedMember", ""))
+        top2 = str(row.get("Top2_pred", ""))
+        rest = [m for m in MEMBERS if m not in {top1, top2}]
+        return rest[0] if rest else ""
+
+    out["ThirdMember"] = out.apply(_third, axis=1)
+
+    danger_rows = {56, 44, 17, 50, 58, 24, 30, 2}
+    danger_parity = {"EOEO", "OOOO", "OEEE", "EOOE"}
+    danger_highlow = {"LLLH", "HHLL", "HLLH"}
+
+    out["Top3RescueScore"] = 0
+    out["Top3RescueReasons"] = ""
+
+    reasons_col = []
+    scores = []
+    for _, r in out.iterrows():
+        score = 0
+        reasons = []
+
+        row_num = int(float(r.get("SingleRow", 0) or 0))
+        if row_num in danger_rows:
+            score += 2
+            reasons.append("danger_row")
+
+        if str(r.get("ThirdMember", "")) == "0255":
+            score += 2
+            reasons.append("third_0255")
+
+        if str(r.get("parity_pattern", "")) in danger_parity:
+            score += 1
+            reasons.append("danger_parity")
+
+        if str(r.get("highlow_pattern", "")) in danger_highlow:
+            score += 1
+            reasons.append("danger_highlow")
+
+        if str(r.get("sum_bucket", "")) == "sum_18_21":
+            score += 1
+            reasons.append("sum_18_21")
+
+        if str(r.get("StreamTier", "")) in {"B_26_50", "C_51_75"}:
+            score += 1
+            reasons.append("mid_tier_miss_zone")
+
+        scores.append(score)
+        reasons_col.append("|".join(reasons))
+
+    out["Top3RescueScore"] = scores
+    out["Top3RescueReasons"] = reasons_col
+    out["Top3Rescue"] = ((out["Top3RescueScore"] >= int(top3_rescue_min_score)) & bool(enable_top3_rescue)).astype(int)
+
+    # Universal score: normalized to 0-100 and family-comparable.
+    # Family apps can use the same column names and weights.
+    score_cols = [c for c in ["score_0025", "score_0225", "score_0255"] if c in out.columns]
+    if score_cols:
+        out["ModelConfidenceRaw"] = out[score_cols].max(axis=1)
+        max_model = pd.to_numeric(out["ModelConfidenceRaw"], errors="coerce").max()
+        out["ModelConfidenceScore"] = (pd.to_numeric(out["ModelConfidenceRaw"], errors="coerce") / max_model * 100).fillna(0) if max_model and max_model > 0 else 0
+    else:
+        out["ModelConfidenceScore"] = 0
+
+    out["RowStrengthScore"] = (100 - pd.to_numeric(out.get("RowPercentile", 100), errors="coerce")).clip(0, 100).fillna(0)
+
+    dens = pd.to_numeric(out.get("hit_density", 0), errors="coerce").fillna(0)
+    max_dens = dens.max()
+    out["FamilyHitDensityScore"] = (dens / max_dens * 100) if max_dens and max_dens > 0 else 0
+
+    out["MissOutlierRiskScore"] = (out["Top3RescueScore"] * 10).clip(0, 100)
+
+    total_weight = float(w_model) + float(w_row) + float(w_density) + float(w_outlier)
+    if total_weight <= 0:
+        total_weight = 1.0
+
+    out["UniversalFamilyScore"] = (
+        (out["ModelConfidenceScore"] * float(w_model))
+        + (out["RowStrengthScore"] * float(w_row))
+        + (out["FamilyHitDensityScore"] * float(w_density))
+        - (out["MissOutlierRiskScore"] * float(w_outlier))
+    ) / total_weight
+    out["UniversalFamilyScore"] = out["UniversalFamilyScore"].round(2)
+
+    return out
+
+
+def apply_play_recommendation(df: pd.DataFrame, play_policy: str) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        return out
+
+    if "PlayType" not in out.columns or out["PlayType"].isna().all() or (out["PlayType"].astype(str).str.len() == 0).all():
+        if play_policy.startswith("Full capture"):
+            out["PlayType"] = "TOP1_TOP2"
+        elif play_policy.startswith("Top2 risk"):
+            out["PlayType"] = out["Top2Decision"].apply(lambda x: "TOP1_TOP2" if str(x) == "TOP2_REQUIRED" else "TOP1_ONLY")
+        else:
+            out["PlayType"] = "TOP1_ONLY"
+        if "Top3Rescue" in out.columns:
+            out.loc[out["Top3Rescue"] == 1, "PlayType"] = "TOP1_TOP2_TOP3"
+
+    def _bold_play(row):
+        top1 = str(row.get("PredictedMember", ""))
+        top2 = str(row.get("Top2_pred", ""))
+        top3 = str(row.get("ThirdMember", ""))
+        if row["PlayType"] == "TOP1_TOP2_TOP3":
+            parts = [f"**{top1}**", f"**{top2}**", f"**{top3}**"]
+        elif row["PlayType"] == "TOP1_TOP2":
+            parts = [f"**{top1}**", f"**{top2}**"]
+        else:
+            parts = [f"**{top1}**"]
+        return " + ".join([p for p in parts if p and p != "****"])
+
+    out["RecommendedPlay"] = out.apply(_bold_play, axis=1)
+    out["Top1_Display"] = out["PredictedMember"].apply(lambda x: f"**{x}**")
+    out["Top2_Display"] = out.apply(lambda r: f"**{r['Top2_pred']}**" if r["PlayType"] in ["TOP1_TOP2", "TOP1_TOP2_TOP3"] else str(r["Top2_pred"]), axis=1)
+    out["Top3_Display"] = out.apply(lambda r: f"**{r['ThirdMember']}**" if r["PlayType"] == "TOP1_TOP2_TOP3" else str(r.get("ThirdMember", "")), axis=1)
+    return out
+
+
+def add_stream_selection_flags(df: pd.DataFrame, recommended_top_n: int, row_pct_cutoff: int) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        return out
+    out["RecommendedByTopN"] = (pd.to_numeric(out["StreamRank"], errors="coerce") <= int(recommended_top_n)).astype(int)
+    out["RecommendedByRowPct"] = (pd.to_numeric(out["RowPercentile"], errors="coerce") <= int(row_pct_cutoff)).astype(int)
+    out["RecommendedStream"] = ((out["RecommendedByTopN"] == 1) | (out["RecommendedByRowPct"] == 1)).astype(int)
+    return out
+
+
+def summarize_policy(df: pd.DataFrame, mask, label: str, play_policy: str) -> Dict:
+    sub = df[mask].copy()
+    total = len(sub)
+    if total == 0:
+        return {
+            "method": label, "rows": 0, "top1": 0, "top2_captured": 0, "top3_captured": 0,
+            "captured": 0, "miss": 0, "capture_pct": 0.0, "plays": 0, "plays_per_capture": None
+        }
+
+    top1 = int(sub["Top1_Correct"].sum())
+    top2_all = int(sub["Needed_Top2"].sum())
+
+    if "PlayType" in sub.columns:
+        top2_captured = int(((sub["Needed_Top2"] == 1) & (sub["PlayType"].isin(["TOP1_TOP2", "TOP1_TOP2_TOP3"]))).sum())
+        top3_captured = int(((sub["Miss"] == 1) & (sub["PlayType"] == "TOP1_TOP2_TOP3")).sum())
+        plays = int((sub["PlayType"] == "TOP1_ONLY").sum() + 2*(sub["PlayType"] == "TOP1_TOP2").sum() + 3*(sub["PlayType"] == "TOP1_TOP2_TOP3").sum())
+    elif play_policy.startswith("Full capture"):
+        top2_captured = top2_all
+        top3_captured = 0
+        plays = total * 2
+    elif play_policy.startswith("Top2 risk"):
+        top2_captured = int(((sub["Needed_Top2"] == 1) & (sub["Top2Decision"] == "TOP2_REQUIRED")).sum())
+        top3_captured = 0
+        plays = total + int((sub["Top2Decision"] == "TOP2_REQUIRED").sum())
+    else:
+        top2_captured = 0
+        top3_captured = 0
+        plays = total
+
+    captured = top1 + top2_captured + top3_captured
+    miss = total - captured
+    return {
+        "method": label,
+        "rows": total,
+        "top1": top1,
+        "top2_captured": top2_captured,
+        "top3_captured": top3_captured,
+        "captured": captured,
+        "miss": miss,
+        "capture_pct": round((captured / total * 100), 2) if total else 0.0,
+        "plays": int(plays),
+        "plays_per_capture": round((plays / captured), 3) if captured else None,
+    }
+
+
+def build_stream_method_tests(res: pd.DataFrame, play_policy: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if res.empty or "StreamRank" not in res.columns:
+        return pd.DataFrame(), pd.DataFrame()
+
+    work = res.copy()
+    work["StreamRank"] = pd.to_numeric(work["StreamRank"], errors="coerce")
+    max_rank = int(work["StreamRank"].max()) if work["StreamRank"].notna().any() else 0
+    rows = []
+
+    rows.append(summarize_policy(work, work["StreamRank"].notna(), "ALL_STREAMS", play_policy))
+
+    for n in [10, 15, 20, 25, 30, 40, 50, 60]:
+        if n <= max_rank:
+            rows.append(summarize_policy(work, work["StreamRank"] <= n, f"TOP_{n}_STREAM_ROWS", play_policy))
+
+    for pct in [10, 15, 20, 25, 30, 40, 50, 60, 70, 80]:
+        cutoff = max(1, int(round(max_rank * pct / 100)))
+        rows.append(summarize_policy(work, work["StreamRank"] <= cutoff, f"ROW_PERCENTILE_TOP_{pct}", play_policy))
+
+    if "StreamTier" in work.columns:
+        for tier in ["A_TOP25", "B_26_50", "C_51_75", "D_76_100"]:
+            rows.append(summarize_policy(work, work["StreamTier"] == tier, f"STREAM_TIER_{tier}", play_policy))
+
+    method_df = pd.DataFrame(rows)
+
+    single_rows = []
+    for rnk, g in work.groupby("StreamRank", dropna=True):
+        single_rows.append(summarize_policy(g, pd.Series([True] * len(g), index=g.index), f"SINGLE_ROW_{int(rnk)}", play_policy))
+    single_df = pd.DataFrame(single_rows)
+    if not single_df.empty:
+        single_df["SingleRow"] = single_df["method"].str.replace("SINGLE_ROW_", "", regex=False).astype(int)
+        single_df = single_df.sort_values("SingleRow")
+    return method_df, single_df
+
+
+
+
+def apply_history_lookback(hist: pd.DataFrame, choice: str) -> pd.DataFrame:
+    """Apply component-level history lookback without mutating the uploaded raw history."""
+    if hist is None or hist.empty:
+        return hist
+    choice = str(choice or "Full")
+    if choice == "Full":
+        return hist.copy()
+    years = {"4 Years": 4, "3 Years": 3, "2 Years": 2}.get(choice)
+    if not years:
+        return hist.copy()
+    max_date = pd.to_datetime(hist["Date"], errors="coerce").max()
+    cutoff = max_date - pd.DateOffset(years=years)
+    return hist[pd.to_datetime(hist["Date"], errors="coerce") >= cutoff].copy()
+
+
+def add_data_freshness_columns(df: pd.DataFrame, hist: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if hist is None or hist.empty or out.empty:
+        return out
+    global_last = pd.to_datetime(hist["Date"], errors="coerce").max()
+    stream_last = hist.groupby("StreamKey")["Date"].max().reset_index().rename(columns={"Date": "Stream_Last_Draw_Date"})
+    out = out.merge(stream_last, on="StreamKey", how="left")
+    out["Data_Last_Draw_Date"] = global_last
+    out["Seed_Date"] = out["Stream_Last_Draw_Date"]
+    out["Days_Since_Stream_Update"] = (global_last - pd.to_datetime(out["Stream_Last_Draw_Date"], errors="coerce")).dt.days
+    out["Stale_Stream_Flag"] = out["Days_Since_Stream_Update"].apply(lambda x: "REVIEW" if pd.notna(x) and int(x) >= 3 else "OK")
+    out["Prediction_Run_Timestamp"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    return out
+
+
+def build_all_draw_event_rows(hist: pd.DataFrame) -> pd.DataFrame:
+    """Every stream transition, including non-Core025 outcomes, for real-world all-event cost testing."""
+    rows = []
+    for stream, g in hist.groupby("StreamKey"):
+        g = g.sort_values("Date").reset_index(drop=True)
+        for i in range(1, len(g)):
+            true_member = result_to_core025_member(g.loc[i, "Result"])
+            rows.append({
+                "StreamKey": stream,
+                "Date": g.loc[i, "Date"],
+                "seed": g.loc[i - 1, "Result"],
+                "TrueMember": true_member,
+                "IsCore025Hit": int(true_member in MEMBERS),
+                "Result": g.loc[i, "Result"],
+            })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return enrich_seed_features(out, "seed")
+
+
+def score_event_rows_for_current_model(
+    event_rows: pd.DataFrame,
+    rules: pd.DataFrame,
+    stream_diag: pd.DataFrame,
+    trait_weight: float,
+    min_margin: float,
+    enable_margin_swap: bool,
+    top2_zone_ratio: float,
+    top2_zone_margin: float,
+    top2_risk_threshold: int,
+    enable_top3_rescue: bool,
+    top3_rescue_min_score: int,
+    w_model: float,
+    w_row: float,
+    w_density: float,
+    w_outlier: float,
+    row_model_df: Optional[pd.DataFrame],
+    enable_row_playtype_model: bool,
+    play_policy: str,
+) -> pd.DataFrame:
+    scored = []
+    if event_rows is None or event_rows.empty:
+        return pd.DataFrame()
+    for _, row in event_rows.iterrows():
+        pick = v22_pick(row, rules, trait_weight, min_margin, enable_margin_swap, top2_zone_ratio, top2_zone_margin, top2_risk_threshold) if rules is not None and not rules.empty else {
+            "PredictedMember": "0025", "Top2_pred": "0225", "Margin": 0.0, "Top2ToTop1Ratio": 0.0,
+            "Top2Zone": 0, "Top2RiskScore": 0, "Top2Decision": "TOP1_SAFE", "Top2RiskReasons": "",
+            "DecisionMode": "NO_RULES_DEFAULT", "MarginSwap": 0, "Fired_Rules": "",
+            "GATED_TOP3": 0, "score_0025": 0, "score_0225": 0, "score_0255": 0
+        }
+        true_member = normalize_member(row.get("TrueMember", ""))
+        top1 = int(true_member in MEMBERS and pick["PredictedMember"] == true_member)
+        top2_needed = int(true_member in MEMBERS and top1 == 0 and pick["Top2_pred"] == true_member)
+        miss = int(true_member in MEMBERS and top1 == 0 and top2_needed == 0)
+        scored.append({**row.to_dict(), **pick, "Top1_Correct": top1, "Needed_Top2": top2_needed, "Miss": miss})
+    res = pd.DataFrame(scored)
+    if res.empty:
+        return res
+    merge_cols = [c for c in [
+        "StreamKey", "hit_density", "rank", "StreamRank", "kept", "RowPercentile",
+        "SingleRow", "RowBucket10", "StreamTier", "RecommendedByTopN",
+        "RecommendedByRowPct", "RecommendedStream"
+    ] if c in stream_diag.columns]
+    res = res.merge(stream_diag[merge_cols], on="StreamKey", how="left")
+    res = add_rare_top3_and_universal_scores(res, enable_top3_rescue, top3_rescue_min_score, w_model, w_row, w_density, w_outlier)
+    res = apply_row_playtype_model(res, row_model_df, enable_row_playtype_model)
+    res = apply_play_recommendation(res, play_policy)
+    return res
+
+
+def add_seed_play_overlay(df: pd.DataFrame, enabled: bool = True) -> pd.DataFrame:
+    """Optional seed/score-based overlay. It never removes box predictions; it labels stronger play rows."""
+    out = df.copy()
+    if out.empty:
+        return out
+    if not enabled:
+        out["SeedPlayTier"] = "PLAY_STANDARD"
+        out["SeedPlayReason"] = "overlay_disabled"
+        out["SeedPlayRecommended"] = 1
+        return out
+    margin = pd.to_numeric(out.get("Margin", 0), errors="coerce").fillna(0)
+    ratio = pd.to_numeric(out.get("Top2ToTop1Ratio", 0), errors="coerce").fillna(0)
+    vol = pd.to_numeric(out.get("RowVolatilityRate", 0), errors="coerce").fillna(0)
+    universal = pd.to_numeric(out.get("UniversalFamilyScore", 0), errors="coerce").fillna(0)
+    top2risk = pd.to_numeric(out.get("Top2RiskScore", 0), errors="coerce").fillna(0)
+    rec = pd.to_numeric(out.get("RecommendedStream", 1), errors="coerce").fillna(1)
+    strong = (rec == 1) & ((universal >= 45) | (top2risk > 0) | (vol >= 0.50) | (ratio >= 0.35) | (margin <= 25))
+    caution = (rec == 1) & (~strong)
+    out["SeedPlayTier"] = "WATCH_ONLY"
+    out.loc[caution, "SeedPlayTier"] = "PLAY_CAUTION"
+    out.loc[strong, "SeedPlayTier"] = "PLAY_STRONG"
+    reasons = []
+    for _, r in out.iterrows():
+        rs=[]
+        if int(float(r.get("RecommendedStream", 0) or 0)) == 1: rs.append("recommended_stream")
+        if float(r.get("UniversalFamilyScore", 0) or 0) >= 45: rs.append("universal_score")
+        if float(r.get("Top2RiskScore", 0) or 0) > 0: rs.append("top2_risk")
+        if float(r.get("RowVolatilityRate", 0) or 0) >= 0.50: rs.append("row_volatility")
+        if float(r.get("Top2ToTop1Ratio", 0) or 0) >= 0.35: rs.append("close_top2_ratio")
+        if float(r.get("Margin", 9999) or 9999) <= 25: rs.append("weak_margin")
+        reasons.append("|".join(rs) if rs else "not_selected_by_seed_overlay")
+    out["SeedPlayReason"] = reasons
+    out["SeedPlayRecommended"] = out["SeedPlayTier"].isin(["PLAY_STRONG", "PLAY_CAUTION"]).astype(int)
+    return out
+
+
+def unique_straight_permutations(member: str) -> List[str]:
+    member = normalize_member(member)
+    if member not in MEMBERS:
+        return []
+    return sorted({"".join(p) for p in permutations(member, 4)})
+
+
+def duplicate_position_pattern(perm: str) -> str:
+    counts = pd.Series(list(str(perm))).value_counts().to_dict()
+    dup_digits = [d for d, c in counts.items() if c > 1]
+    if not dup_digits:
+        return "none"
+    d = sorted(dup_digits)[0]
+    positions = [str(i + 1) for i, ch in enumerate(str(perm)) if ch == d]
+    return "-".join(positions)
+
+
+def ordered_pairs_4(perm: str) -> List[str]:
+    s4 = str(perm).zfill(4)[-4:]
+    return [s4[0:2], s4[1:3], s4[2:4]]
+
+
+def build_straight_training_events(hist: pd.DataFrame, lookback_days: int = 730) -> pd.DataFrame:
+    rows = []
+    for stream, g in hist.groupby("StreamKey"):
+        g = g.sort_values("Date").reset_index(drop=True)
+        for i in range(1, len(g)):
+            member = result_to_core025_member(g.loc[i, "Result"])
+            if member in MEMBERS:
+                rows.append({
+                    "StreamKey": stream,
+                    "Date": g.loc[i, "Date"],
+                    "seed": g.loc[i - 1, "Result"],
+                    "TrueMember": member,
+                    "StraightResult": extract_pick4_digits(g.loc[i, "Result"]),
+                    "Result": extract_pick4_digits(g.loc[i, "Result"]),
+                })
+    events = pd.DataFrame(rows)
+    if events.empty:
+        return events
+    events = enrich_seed_features(events, "seed")
+    events["DupPattern"] = events["StraightResult"].apply(duplicate_position_pattern)
+    events["Pair12"] = events["StraightResult"].astype(str).str[0:2]
+    events["Pair23"] = events["StraightResult"].astype(str).str[1:3]
+    events["Pair34"] = events["StraightResult"].astype(str).str[2:4]
+    for pos in range(4):
+        events[f"pos{pos+1}"] = events["StraightResult"].astype(str).str[pos]
+    return events
+
+
+def _rate_with_support(df: pd.DataFrame, numerator_mask, min_support: int = 1) -> Tuple[float, int]:
+    support = int(len(df))
+    if support < int(min_support) or support <= 0:
+        return 0.0, support
+    return float(pd.Series(numerator_mask).sum()) / support, support
+
+
+def straight_member_score(row: pd.Series, member: str) -> float:
+    member = normalize_member(member)
+    score_cols = {m: float(row.get(f"score_{m}", 0) or 0) for m in MEMBERS}
+    max_score = max(score_cols.values()) if score_cols else 0.0
+    if max_score > 0 and member in score_cols:
+        return max(0.0, min(1.0, score_cols[member] / max_score))
+    if member == str(row.get("PredictedMember", "")):
+        return 1.0
+    if member == str(row.get("Top2_pred", "")):
+        return 0.65
+    if member == str(row.get("ThirdMember", "")):
+        return 0.35
+    return 0.0
+
+
+def straight_eligible_members(
+    row: pd.Series,
+    top2_ratio_min: float,
+    top2_margin_max: float,
+    top2_volatility_min: float,
+    top3_margin_max: float,
+    top3_volatility_min: float,
+) -> List[Dict[str, str]]:
+    out = []
+    top1 = normalize_member(row.get("PredictedMember", ""))
+    top2 = normalize_member(row.get("Top2_pred", ""))
+    top3 = normalize_member(row.get("ThirdMember", ""))
+    play_type = str(row.get("PlayType", ""))
+    ratio = float(row.get("Top2ToTop1Ratio", 0) or 0)
+    margin = float(row.get("Margin", 9999) or 9999)
+    risk = int(float(row.get("Top2RiskScore", 0) or 0))
+    vol = float(row.get("RowVolatilityRate", 0) or 0)
+    top3_rescue = int(float(row.get("Top3Rescue", 0) or 0))
+
+    if top1 in MEMBERS:
+        out.append({"StraightMember": top1, "StraightMemberSource": "TOP1", "StraightEligibilityReason": "TOP1_ALWAYS_ELIGIBLE"})
+
+    top2_ok = (
+        top2 in MEMBERS
+        and top2 != top1
+        and play_type in {"TOP1_TOP2", "TOP1_TOP2_TOP3"}
+        and (
+            risk > 0
+            or ratio >= float(top2_ratio_min)
+            or margin <= float(top2_margin_max)
+            or vol >= float(top2_volatility_min)
+        )
+    )
+    if top2_ok:
+        reasons = []
+        if risk > 0: reasons.append("top2_risk")
+        if ratio >= float(top2_ratio_min): reasons.append("ratio")
+        if margin <= float(top2_margin_max): reasons.append("weak_margin")
+        if vol >= float(top2_volatility_min): reasons.append("row_volatility")
+        out.append({"StraightMember": top2, "StraightMemberSource": "TOP2", "StraightEligibilityReason": "|".join(reasons)})
+
+    top3_ok = (
+        top3 in MEMBERS
+        and top3 not in {top1, top2}
+        and play_type == "TOP1_TOP2_TOP3"
+        and top3_rescue == 1
+        and vol >= float(top3_volatility_min)
+        and (margin <= float(top3_margin_max) or risk > 0)
+    )
+    if top3_ok:
+        reasons = ["top3_rescue", "row_volatility"]
+        if margin <= float(top3_margin_max): reasons.append("weak_margin")
+        if risk > 0: reasons.append("top2_risk")
+        out.append({"StraightMember": top3, "StraightMemberSource": "TOP3", "StraightEligibilityReason": "|".join(reasons)})
+
+    return out
+
+
+def score_straight_permutation(row: pd.Series, member: str, perm: str, events: pd.DataFrame, recent_window: int = 30) -> Dict:
+    member = normalize_member(member)
+    perm = str(perm).zfill(4)[-4:]
+    stream = str(row.get("StreamKey", ""))
+    member_events = events[events["TrueMember"] == member].copy()
+    stream_member_events = member_events[member_events["StreamKey"] == stream].copy()
+    trait_events = member_events[
+        (member_events["sum_bucket"].astype(str) == str(row.get("sum_bucket", "")))
+        & (member_events["spread_bucket"].astype(str) == str(row.get("spread_bucket", "")))
+    ].copy()
+    seed_shape_events = member_events[
+        (member_events["parity_pattern"].astype(str) == str(row.get("parity_pattern", "")))
+        & (member_events["highlow_pattern"].astype(str) == str(row.get("highlow_pattern", "")))
+    ].copy()
+    exact_seed_events = member_events[member_events["seed"].astype(str) == str(row.get("seed", ""))].copy()
+
+    pos_rates = []
+    pos_supports = []
+    for i, digit in enumerate(perm):
+        r_global, s_global = _rate_with_support(member_events, member_events[f"pos{i+1}"].astype(str) == digit, 1)
+        r_stream, s_stream = _rate_with_support(stream_member_events, stream_member_events[f"pos{i+1}"].astype(str) == digit, 2)
+        r_trait, s_trait = _rate_with_support(trait_events, trait_events[f"pos{i+1}"].astype(str) == digit, 3)
+        weighted = (0.55 * r_global) + (0.30 * r_stream) + (0.15 * r_trait)
+        pos_rates.append(weighted)
+        pos_supports.append(s_global + s_stream + s_trait)
+    position_score = sum(pos_rates) / 4 if pos_rates else 0.0
+
+    pair_rates = []
+    pair_supports = []
+    pair_cols = ["Pair12", "Pair23", "Pair34"]
+    for pair, col in zip(ordered_pairs_4(perm), pair_cols):
+        r_global, s_global = _rate_with_support(member_events, member_events[col].astype(str) == pair, 1)
+        r_stream, s_stream = _rate_with_support(stream_member_events, stream_member_events[col].astype(str) == pair, 2)
+        r_seedshape, s_seedshape = _rate_with_support(seed_shape_events, seed_shape_events[col].astype(str) == pair, 3)
+        weighted = (0.55 * r_global) + (0.25 * r_stream) + (0.20 * r_seedshape)
+        pair_rates.append(weighted)
+        pair_supports.append(s_global + s_stream + s_seedshape)
+    ordered_pair_score = sum(pair_rates) / 3 if pair_rates else 0.0
+
+    exact_perm_rate, exact_seed_support = _rate_with_support(exact_seed_events, exact_seed_events["StraightResult"].astype(str) == perm, 1)
+    trait_perm_rate, trait_support = _rate_with_support(trait_events, trait_events["StraightResult"].astype(str) == perm, 3)
+    seedshape_perm_rate, seedshape_support = _rate_with_support(seed_shape_events, seed_shape_events["StraightResult"].astype(str) == perm, 3)
+    seed_transition_score = (0.50 * exact_perm_rate) + (0.30 * trait_perm_rate) + (0.20 * seedshape_perm_rate)
+
+    dup = duplicate_position_pattern(perm)
+    dup_rate_global, dup_support_global = _rate_with_support(member_events, member_events["DupPattern"].astype(str) == dup, 1)
+    dup_rate_stream, dup_support_stream = _rate_with_support(stream_member_events, stream_member_events["DupPattern"].astype(str) == dup, 2)
+    repeat_placement_score = (0.70 * dup_rate_global) + (0.30 * dup_rate_stream)
+
+    first_rate, first_support = _rate_with_support(stream_member_events, stream_member_events["pos1"].astype(str) == perm[0], 2)
+    last_rate, last_support = _rate_with_support(stream_member_events, stream_member_events["pos4"].astype(str) == perm[3], 2)
+    stream_order_score = (first_rate + last_rate) / 2 if (first_support + last_support) > 0 else 0.0
+
+    recent = stream_member_events.sort_values("Date").tail(int(recent_window))
+    recent_rate, recent_support = _rate_with_support(recent, recent["StraightResult"].astype(str) == perm, 1)
+    recent_front_rate, recent_front_support = _rate_with_support(recent, recent["pos1"].astype(str) == perm[0], 2)
+    recent_back_rate, recent_back_support = _rate_with_support(recent, recent["pos4"].astype(str) == perm[3], 2)
+    recent_order_score = (0.50 * recent_rate) + (0.25 * recent_front_rate) + (0.25 * recent_back_rate)
+
+    member_confidence = straight_member_score(row, member)
+    total_score = (
+        (member_confidence * 0.25)
+        + (position_score * 0.25)
+        + (ordered_pair_score * 0.20)
+        + (seed_transition_score * 0.15)
+        + (stream_order_score * 0.10)
+        + (recent_order_score * 0.05)
+    )
+
+    evidence_support = int(sum(pos_supports) + sum(pair_supports) + exact_seed_support + trait_support + seedshape_support + dup_support_global + dup_support_stream + first_support + last_support + recent_support + recent_front_support + recent_back_support)
+
+    return {
+        "StraightPermutation": perm,
+        "MemberConfidenceScore": round(member_confidence * 100, 2),
+        "PositionScore": round(position_score * 100, 2),
+        "OrderedPairScore": round(ordered_pair_score * 100, 2),
+        "SeedTransitionScore": round(seed_transition_score * 100, 2),
+        "StreamOrderScore": round(stream_order_score * 100, 2),
+        "RecentOrderScore": round(recent_order_score * 100, 2),
+        "RepeatPlacementScore": round(repeat_placement_score * 100, 2),
+        "StraightConfidenceScore": round(total_score * 100, 2),
+        "EvidenceSupport": evidence_support,
+        "DupPattern": dup,
+        "StraightScoreFormula": "25% member + 25% position + 20% ordered_pair + 15% seed_transition + 10% stream_order + 5% recent_order",
+    }
+
+
+def build_straight_playlist(
+    playlist: pd.DataFrame,
+    hist: pd.DataFrame,
+    recommended_only: bool,
+    top2_ratio_min: float,
+    top2_margin_max: float,
+    top2_volatility_min: float,
+    top3_margin_max: float,
+    top3_volatility_min: float,
+    max_straights_per_stream: int,
+    straight_lookback_days: int = 730,
+    recent_window: int = 30,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    events = build_straight_training_events(hist, straight_lookback_days)
+    if playlist is None or playlist.empty or events.empty:
+        empty = pd.DataFrame()
+        return empty, empty
+
+    base = playlist.copy()
+    if recommended_only and "RecommendedStream" in base.columns:
+        base = base[pd.to_numeric(base["RecommendedStream"], errors="coerce").fillna(0).astype(int) == 1].copy()
+
+    rows = []
+    for _, row in base.iterrows():
+        eligible = straight_eligible_members(row, top2_ratio_min, top2_margin_max, top2_volatility_min, top3_margin_max, top3_volatility_min)
+        for em in eligible:
+            member = em["StraightMember"]
+            for perm in unique_straight_permutations(member):
+                score = score_straight_permutation(row, member, perm, events)
+                rows.append({
+                    "PlaylistRank": row.get("PlaylistRank", ""),
+                    "RecommendedStream": row.get("RecommendedStream", ""),
+                    "StreamRank": row.get("StreamRank", ""),
+                    "RowPercentile": row.get("RowPercentile", ""),
+                    "SingleRow": row.get("SingleRow", ""),
+                    "StreamTier": row.get("StreamTier", ""),
+                    "StreamKey": row.get("StreamKey", ""),
+                    "State": row.get("State", ""),
+                    "Game": row.get("Game", ""),
+                    "seed": row.get("seed", ""),
+                    "LastResult": row.get("LastResult", ""),
+                    "BoxPlayType": row.get("PlayType", ""),
+                    "BoxRecommendedPlay": row.get("RecommendedPlay", ""),
+                    "PredictedMember": row.get("PredictedMember", ""),
+                    "Top2_pred": row.get("Top2_pred", ""),
+                    "ThirdMember": row.get("ThirdMember", ""),
+                    "StraightMember": member,
+                    "StraightMemberSource": em["StraightMemberSource"],
+                    "StraightEligibilityReason": em["StraightEligibilityReason"],
+                    "Margin": row.get("Margin", ""),
+                    "Top2ToTop1Ratio": row.get("Top2ToTop1Ratio", ""),
+                    "Top2RiskScore": row.get("Top2RiskScore", ""),
+                    "Top3Rescue": row.get("Top3Rescue", ""),
+                    "RowVolatilityRate": row.get("RowVolatilityRate", ""),
+                    **score,
+                })
+
+    straight = pd.DataFrame(rows)
+    if straight.empty:
+        return straight, pd.DataFrame()
+
+    straight = straight.sort_values(
+        ["RecommendedStream", "PlaylistRank", "StraightConfidenceScore", "EvidenceSupport"],
+        ascending=[False, True, False, False]
+    ).reset_index(drop=True)
+    straight["OverallStraightRank"] = straight.index + 1
+    straight["StreamStraightRank"] = straight.groupby("StreamKey")["StraightConfidenceScore"].rank(method="first", ascending=False).astype(int)
+    straight["RecommendedStraight"] = (straight["StreamStraightRank"] <= int(max_straights_per_stream)).astype(int)
+    straight["RecommendedStraightDisplay"] = straight.apply(lambda r: f"**{r['StraightPermutation']}**" if int(r["RecommendedStraight"]) == 1 else str(r["StraightPermutation"]), axis=1)
+
+    summary = straight.groupby("StreamKey", dropna=False).agg(
+        eligible_members=("StraightMember", lambda series: ",".join(sorted(set(map(str, series))))),
+        total_candidate_straights=("StraightPermutation", "count"),
+        recommended_straights=("RecommendedStraight", "sum"),
+        best_straight=("StraightPermutation", "first"),
+        best_confidence=("StraightConfidenceScore", "first"),
+        box_play_type=("BoxPlayType", "first"),
+        box_play=("BoxRecommendedPlay", "first"),
+        stream_rank=("StreamRank", "first"),
+        row_percentile=("RowPercentile", "first"),
+    ).reset_index()
+    summary = summary.sort_values(["stream_rank", "best_confidence"], ascending=[True, False]).reset_index(drop=True)
+    return straight, summary
+
+
+# ================================
+# V48 STRAIGHT WALK-FORWARD BACKTEST HELPERS
+# ================================
+
+
+def _v48_counter_rate(count: int, total: int, min_support: int = 1) -> Tuple[float, int]:
+    total = int(total or 0)
+    if total < int(min_support) or total <= 0:
+        return 0.0, total
+    return float(count or 0) / total, total
+
+
+def v48_empty_straight_cache() -> Dict:
+    from collections import Counter, defaultdict, deque
+    return {
+        "member_total": Counter(),
+        "pos": Counter(),
+        "pair": Counter(),
+        "stream_total": Counter(),
+        "stream_pos": Counter(),
+        "stream_pair": Counter(),
+        "trait_total": Counter(),
+        "trait_pos": Counter(),
+        "trait_perm": Counter(),
+        "seedshape_total": Counter(),
+        "seedshape_pair": Counter(),
+        "seedshape_perm": Counter(),
+        "exact_total": Counter(),
+        "exact_perm": Counter(),
+        "recent_total": Counter(),
+        "recent_perm": Counter(),
+        "recent_pos1": Counter(),
+        "recent_pos4": Counter(),
+        "recent_queue": defaultdict(deque),
+    }
+
+
+def v48_add_event_to_straight_cache(cache: Dict, r: pd.Series, recent_window: int = 30) -> None:
+    member = normalize_member(r.get("TrueMember", ""))
+    straight = extract_pick4_digits(r.get("StraightResult", r.get("Result", "")))
+    if member not in MEMBERS or len(straight) != 4:
+        return
+    stream = str(r.get("StreamKey", ""))
+    trait_key = (member, str(r.get("sum_bucket", "")), str(r.get("spread_bucket", "")))
+    seedshape_key = (member, str(r.get("parity_pattern", "")), str(r.get("highlow_pattern", "")))
+    exact_key = (member, str(r.get("seed", "")))
+
+    cache["member_total"][member] += 1
+    cache["stream_total"][(member, stream)] += 1
+    cache["trait_total"][trait_key] += 1
+    cache["trait_perm"][(trait_key, straight)] += 1
+    cache["seedshape_total"][seedshape_key] += 1
+    cache["seedshape_perm"][(seedshape_key, straight)] += 1
+    cache["exact_total"][exact_key] += 1
+    cache["exact_perm"][(exact_key, straight)] += 1
+
+    for i, digit in enumerate(straight, 1):
+        cache["pos"][(member, i, digit)] += 1
+        cache["stream_pos"][(member, stream, i, digit)] += 1
+        cache["trait_pos"][(trait_key, i, digit)] += 1
+
+    for j, pair in enumerate(ordered_pairs_4(straight), 1):
+        cache["pair"][(member, j, pair)] += 1
+        cache["stream_pair"][(member, stream, j, pair)] += 1
+        cache["seedshape_pair"][(seedshape_key, j, pair)] += 1
+
+    qkey = (member, stream)
+    q = cache["recent_queue"][qkey]
+    q.append((straight, straight[0], straight[3]))
+    cache["recent_total"][qkey] += 1
+    cache["recent_perm"][(member, stream, straight)] += 1
+    cache["recent_pos1"][(member, stream, straight[0])] += 1
+    cache["recent_pos4"][(member, stream, straight[3])] += 1
+
+    while len(q) > int(recent_window):
+        old_straight, old_front, old_back = q.popleft()
+        cache["recent_total"][qkey] -= 1
+        cache["recent_perm"][(member, stream, old_straight)] -= 1
+        cache["recent_pos1"][(member, stream, old_front)] -= 1
+        cache["recent_pos4"][(member, stream, old_back)] -= 1
+
+
+def v48_fast_score_straight(row: pd.Series, member: str, perm: str, cache: Dict) -> Tuple[float, int]:
+    member = normalize_member(member)
+    perm = str(perm).zfill(4)[-4:]
+    stream = str(row.get("StreamKey", ""))
+    trait_key = (member, str(row.get("sum_bucket", "")), str(row.get("spread_bucket", "")))
+    seedshape_key = (member, str(row.get("parity_pattern", "")), str(row.get("highlow_pattern", "")))
+    exact_key = (member, str(row.get("seed", "")))
+
+    member_total = cache["member_total"][member]
+    stream_total = cache["stream_total"][(member, stream)]
+    trait_total = cache["trait_total"][trait_key]
+    seedshape_total = cache["seedshape_total"][seedshape_key]
+    exact_total = cache["exact_total"][exact_key]
+    recent_total = cache["recent_total"][(member, stream)]
+
+    evidence = 0
+    pos_rates = []
+    for i, digit in enumerate(perm, 1):
+        r_global, s_global = _v48_counter_rate(cache["pos"][(member, i, digit)], member_total, 1)
+        r_stream, s_stream = _v48_counter_rate(cache["stream_pos"][(member, stream, i, digit)], stream_total, 2)
+        r_trait, s_trait = _v48_counter_rate(cache["trait_pos"][(trait_key, i, digit)], trait_total, 3)
+        pos_rates.append((0.55 * r_global) + (0.30 * r_stream) + (0.15 * r_trait))
+        evidence += s_global + s_stream + s_trait
+    position_score = sum(pos_rates) / 4 if pos_rates else 0.0
+
+    pair_rates = []
+    for j, pair in enumerate(ordered_pairs_4(perm), 1):
+        r_global, s_global = _v48_counter_rate(cache["pair"][(member, j, pair)], member_total, 1)
+        r_stream, s_stream = _v48_counter_rate(cache["stream_pair"][(member, stream, j, pair)], stream_total, 2)
+        r_seedshape, s_seedshape = _v48_counter_rate(cache["seedshape_pair"][(seedshape_key, j, pair)], seedshape_total, 3)
+        pair_rates.append((0.55 * r_global) + (0.25 * r_stream) + (0.20 * r_seedshape))
+        evidence += s_global + s_stream + s_seedshape
+    ordered_pair_score = sum(pair_rates) / 3 if pair_rates else 0.0
+
+    exact_rate, exact_support = _v48_counter_rate(cache["exact_perm"][(exact_key, perm)], exact_total, 1)
+    trait_rate, trait_support = _v48_counter_rate(cache["trait_perm"][(trait_key, perm)], trait_total, 3)
+    seedshape_rate, seedshape_support = _v48_counter_rate(cache["seedshape_perm"][(seedshape_key, perm)], seedshape_total, 3)
+    seed_transition_score = (0.50 * exact_rate) + (0.30 * trait_rate) + (0.20 * seedshape_rate)
+    evidence += exact_support + trait_support + seedshape_support
+
+    front_rate, front_support = _v48_counter_rate(cache["stream_pos"][(member, stream, 1, perm[0])], stream_total, 2)
+    back_rate, back_support = _v48_counter_rate(cache["stream_pos"][(member, stream, 4, perm[3])], stream_total, 2)
+    stream_order_score = (front_rate + back_rate) / 2 if (front_support + back_support) > 0 else 0.0
+    evidence += front_support + back_support
+
+    recent_perm_rate, recent_perm_support = _v48_counter_rate(cache["recent_perm"][(member, stream, perm)], recent_total, 1)
+    recent_front_rate, recent_front_support = _v48_counter_rate(cache["recent_pos1"][(member, stream, perm[0])], recent_total, 2)
+    recent_back_rate, recent_back_support = _v48_counter_rate(cache["recent_pos4"][(member, stream, perm[3])], recent_total, 2)
+    recent_order_score = (0.50 * recent_perm_rate) + (0.25 * recent_front_rate) + (0.25 * recent_back_rate)
+    evidence += recent_perm_support + recent_front_support + recent_back_support
+
+    total_score = (
+        (straight_member_score(row, member) * 0.25)
+        + (position_score * 0.25)
+        + (ordered_pair_score * 0.20)
+        + (seed_transition_score * 0.15)
+        + (stream_order_score * 0.10)
+        + (recent_order_score * 0.05)
+    )
+    return total_score * 100, evidence
+
+
+def v48_prepare_straight_backtest_events(lab_results: pd.DataFrame) -> pd.DataFrame:
+    events = lab_results.copy()
+    if "TrueMember" not in events.columns:
+        events["TrueMember"] = ""
+    events["TrueMember"] = events["TrueMember"].apply(normalize_member)
+    events["StraightResult"] = events["Result"].apply(extract_pick4_digits)
+    if "IsCore025Hit" not in events.columns:
+        events["IsCore025Hit"] = events["TrueMember"].isin(MEMBERS).astype(int)
+    if "Date" in events.columns:
+        events["Date"] = pd.to_datetime(events["Date"], errors="coerce")
+    return events.sort_values(["Date", "StreamKey"]).reset_index(drop=True)
+
+
+def run_v50_straight_backtest(
+    lab_results: pd.DataFrame,
+    max_depth: int = 2,
+    recommended_only: bool = False,
+    scope_label: str = "Member-Only Events (diagnostic)",
+    recent_window: int = 30,
+    max_events: Optional[int] = None,
+    batch_size: int = 25,
+    progress_bar=None,
+    status_box=None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """TRUE BLIND straight walk-forward: each row is scored using only prior Core025 hit events."""
+    if lab_results is None or lab_results.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    work = lab_results.copy()
+    for col in ["Margin", "Top2ToTop1Ratio", "Top2RiskScore", "Top3Rescue", "RowVolatilityRate", "RecommendedStream", "score_0025", "score_0225", "score_0255"]:
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0)
+
+    events = v48_prepare_straight_backtest_events(work)
+    total_available_events = len(events)
+    if max_events is not None and int(max_events) > 0:
+        events = events.head(int(max_events)).copy()
+    events_to_process = len(events)
+    cache = v48_empty_straight_cache()
+    rows = []
+
+    for event_idx, (_, row) in enumerate(events.iterrows(), start=1):
+        if status_box is not None and (event_idx == 1 or event_idx % max(1, int(batch_size)) == 0 or event_idx == events_to_process):
+            try:
+                status_box.write(f"Processing event {event_idx:,} / {events_to_process:,} — {row.get('Date', '')} — {row.get('StreamKey', '')}")
+            except Exception:
+                pass
+        if progress_bar is not None and events_to_process:
+            try:
+                progress_bar.progress(min(event_idx / events_to_process, 1.0))
+            except Exception:
+                pass
+        if recommended_only and int(float(row.get("RecommendedStream", 1) or 0)) != 1:
+            if normalize_member(row.get("TrueMember", "")) in MEMBERS:
+                v48_add_event_to_straight_cache(cache, row, int(recent_window))
+            continue
+
+        candidates = []
+        for member_info in straight_eligible_members(row, 0.35, 25.0, 0.50, 35.0, 0.50):
+            member = member_info["StraightMember"]
+            for perm in unique_straight_permutations(member):
+                score, evidence = v48_fast_score_straight(row, member, perm, cache)
+                candidates.append({
+                    "StraightPermutation": perm,
+                    "StraightMember": member,
+                    "StraightMemberSource": member_info["StraightMemberSource"],
+                    "StraightEligibilityReason": member_info["StraightEligibilityReason"],
+                    "StraightConfidenceScore": round(score, 2),
+                    "EvidenceSupport": int(evidence),
+                })
+
+        true_member = normalize_member(row.get("TrueMember", ""))
+        true_straight = extract_pick4_digits(row.get("Result", ""))
+        candidates = sorted(candidates, key=lambda x: (x["StraightConfidenceScore"], x["EvidenceSupport"]), reverse=True)
+        rank_lookup = {c["StraightPermutation"]: i + 1 for i, c in enumerate(candidates)}
+        hit_rank = rank_lookup.get(true_straight) if true_member in MEMBERS else None
+        top1 = candidates[0]["StraightPermutation"] if len(candidates) >= 1 else ""
+        top2 = candidates[1]["StraightPermutation"] if len(candidates) >= 2 else ""
+        top3 = candidates[2]["StraightPermutation"] if len(candidates) >= 3 else ""
+        is_hit_event = int(true_member in MEMBERS)
+        eligible_members_set = set(c["StraightMember"] for c in candidates)
+        correct_member_eligible = int(true_member in eligible_members_set) if is_hit_event else 0
+        true_in_candidates = int(hit_rank is not None)
+        true_recommended = int(hit_rank is not None and hit_rank <= int(max_depth))
+        if not is_hit_event:
+            miss_reason = "NON_CORE025_EVENT"
+        elif not correct_member_eligible:
+            miss_reason = "CORRECT_MEMBER_NOT_ELIGIBLE"
+        elif not true_in_candidates:
+            miss_reason = "TRUE_STRAIGHT_NOT_IN_CANDIDATES"
+        elif not true_recommended:
+            miss_reason = "TRUE_STRAIGHT_RANK_BEYOND_RECOMMENDED_DEPTH"
+        else:
+            miss_reason = "HIT_WITHIN_RECOMMENDED_DEPTH"
+        top10_list = " | ".join([f"{i+1}:{c['StraightPermutation']}({c['StraightConfidenceScore']})" for i, c in enumerate(candidates[:10])])
+        recommended_list = " | ".join([f"{i+1}:{c['StraightPermutation']}({c['StraightConfidenceScore']})" for i, c in enumerate(candidates[:int(max_depth)])])
+
+        rows.append({
+            **row.to_dict(),
+            "BacktestScope": scope_label,
+            "BlindMode": "TRUE_PRIOR_ONLY",
+            "IsCore025Hit": is_hit_event,
+            "TrueStraight": true_straight,
+            "CandidateCount": len(candidates),
+            "EligibleMembers": ",".join(sorted(eligible_members_set)),
+            "CorrectMemberEligible": correct_member_eligible,
+            "TrueStraightInCandidates": true_in_candidates,
+            "TrueStraightRank": hit_rank,
+            "TrueStraightRecommended": true_recommended,
+            "StraightMissReason": miss_reason,
+            "Top10StraightAudit": top10_list,
+            "RecommendedStraightAudit": recommended_list,
+            "HitRank": hit_rank,
+            "HitInCandidates": int(hit_rank is not None),
+            "Top1Straight": top1,
+            "Top2Straight": top2,
+            "Top3Straight": top3,
+            "Top1StraightHit": int(hit_rank == 1),
+            "Top2StraightHit": int(hit_rank is not None and hit_rank <= 2),
+            "Top3StraightHit": int(hit_rank is not None and hit_rank <= 3),
+            "Top5StraightHit": int(hit_rank is not None and hit_rank <= 5),
+            "Top10StraightHit": int(hit_rank is not None and hit_rank <= 10),
+            "RecommendedStraightDepth": int(max_depth),
+            "RecommendedStraightHit": int(hit_rank is not None and hit_rank <= int(max_depth)),
+            "RecommendedStraightPlays": min(int(max_depth), len(candidates)),
+        })
+
+        if true_member in MEMBERS:
+            v48_add_event_to_straight_cache(cache, row, int(recent_window))
+
+    per_event = pd.DataFrame(rows)
+
+    def _summary(df: pd.DataFrame, label: str) -> Dict:
+        total = len(df)
+        hit_events = int(df.get("IsCore025Hit", pd.Series(dtype=int)).sum()) if total else 0
+        out = {"scope": label, "blind_mode": "TRUE_PRIOR_ONLY", "events": total, "core025_hit_events": hit_events, "available_events_before_limit": total_available_events}
+        for depth, col in [(1, "Top1StraightHit"), (2, "Top2StraightHit"), (3, "Top3StraightHit"), (5, "Top5StraightHit"), (10, "Top10StraightHit")]:
+            hits = int(df[col].sum()) if total else 0
+            out[f"top{depth}_hits"] = hits
+            out[f"top{depth}_hit_pct_of_core025_hits"] = round(hits / hit_events * 100, 2) if hit_events else 0.0
+            out[f"top{depth}_hit_pct_of_all_events"] = round(hits / total * 100, 2) if total else 0.0
+        candidate_hits = int(df["HitInCandidates"].sum()) if total else 0
+        recommended_hits = int(df["RecommendedStraightHit"].sum()) if total else 0
+        recommended_plays = int(df["RecommendedStraightPlays"].sum()) if total else 0
+        out["candidate_pool_hits"] = candidate_hits
+        out["candidate_pool_pct_of_core025_hits"] = round(candidate_hits / hit_events * 100, 2) if hit_events else 0.0
+        out["recommended_depth"] = int(max_depth)
+        out["recommended_hits"] = recommended_hits
+        out["recommended_hit_pct_of_core025_hits"] = round(recommended_hits / hit_events * 100, 2) if hit_events else 0.0
+        out["recommended_hit_pct_of_all_events"] = round(recommended_hits / total * 100, 2) if total else 0.0
+        out["recommended_plays"] = recommended_plays
+        out["plays_per_straight_hit"] = round(recommended_plays / recommended_hits, 3) if recommended_hits else None
+        out["avg_candidate_count"] = round(df["CandidateCount"].mean(), 2) if total else 0.0
+        return out
+
+    summary = pd.DataFrame([_summary(per_event, scope_label)])
+    rankdist = per_event[per_event["IsCore025Hit"] == 1]["HitRank"].fillna("MISS").astype(str).value_counts().rename_axis("HitRank").reset_index(name="count")
+    if not rankdist.empty:
+        rankdist["sort"] = rankdist["HitRank"].apply(lambda x: int(float(x)) if x != "MISS" else 999999)
+        rankdist = rankdist.sort_values("sort").drop(columns="sort").reset_index(drop=True)
+    return per_event, summary, rankdist
+
+
+with st.sidebar:
+    st.header("Cache Controls")
+    if st.button("🔄 Clear cache / force reload", use_container_width=True):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        for _k in list(st.session_state.keys()):
+            if str(_k).startswith(("daily_", "lab_", "straight_", "stream_", "row_", "percentile_")):
+                st.session_state[_k] = None
+        st.success("Cache cleared. Re-upload or re-run to rebuild from the current files.")
+
+    st.header("Inputs")
+    hist_file = st.file_uploader("Upload FULL HISTORY (.txt/.csv)", type=["txt", "csv", "tsv"], key="hist")
+    last24_file = st.file_uploader("Upload LAST 24 HOURS optional (.txt/.csv)", type=["txt", "csv", "tsv"], key="last24")
+    truth_file = st.file_uploader("Upload FULL TRUTH intelligence file (.csv/.txt)", type=["csv", "txt", "tsv"], key="truth")
+    lib_file = st.file_uploader("Upload promoted separator library CSV", type=["csv"], key="lib")
+    v53_rules_file = st.file_uploader("Upload v53 stacked separator rules CSV", type=["csv"], key="v53_rules")
+    st.markdown("#### v55 mined reports bundle")
+    v55_mined_reports_zip = st.file_uploader("Upload mined reports ZIP from separator miner", type=["zip"], key="v55_mined_reports_zip")
+
+
+    st.header("Defaults")
+    box_lookback_choice = st.selectbox("Box/member engine lookback", ["Full", "4 Years", "3 Years", "2 Years"], index=2)
+    straight_lookback_days = st.selectbox("Straight historical lookback days", [365, 545, 730], index=2)
+    straight_recent_window = st.selectbox("Straight recent adjustment window", [20, 30, 50], index=1)
+    st.markdown("---")
+    st.subheader("v53 Trait Straight Optimizer")
+    v53_enable_trait_optimizer = st.checkbox("Enable v53 trait-rule straight optimizer", value=True)
+    v53_min_rule_hits = st.slider("v53 min rule hits", 1, 10, 2)
+    v53_min_rule_conf = st.slider("v53 min rule confidence %", 0, 100, 30, step=5)
+    v53_min_rule_lift = st.slider("v53 min rule lift", 0.0, 10.0, 1.5, step=0.5)
+    v53_rule_weight = st.slider("v53 rule boost weight", 0.0, 3.0, 1.0, step=0.1)
+    v53_stream_depth = st.slider("v53 stream depth", 1, 30, 15)
+    v53_best_depth = st.slider("v53 best-practice straights per stream", 1, 20, 6)
+    v53_optional_depth = st.slider("v53 optional straight depth per stream", 1, 24, 15)
+    st.markdown("#### v54 structured predictor weights")
+    v54_member_weight = st.slider("v54 member layer weight", 0.0, 100.0, 20.0, step=1.0)
+    v54_double_weight = st.slider("v54 double-position layer weight", 0.0, 100.0, 30.0, step=1.0)
+    v54_pos_weight = st.slider("v54 position-map layer weight", 0.0, 100.0, 25.0, step=1.0)
+    v54_max_stack_boost = st.slider("v54 max stacked-rule boost", 0.0, 100.0, 60.0, step=5.0)
+
+
+    enable_seed_play_overlay = st.checkbox("Enable seed-based play overlay", value=True)
+    window_days = st.slider("Stream reduction window days", 30, 730, 180)
+    prune_pct = st.slider("Prune low-density %", 0, 60, 20)
+    trait_weight = st.slider("Trait Weight", 0.0, 12.0, 5.0)
+    min_margin = st.slider("Min Margin for cautious swap", 0.0, 6.0, 1.0, step=0.1)
+    enable_margin_swap = st.checkbox("Allow cautious Top1/Top2 swap in close-margin danger seeds", value=False)
+
+    st.header("Top2 Risk Gate")
+    top2_zone_ratio = st.slider("Top2 zone ratio trigger", 0.50, 1.00, 0.90, step=0.01)
+    top2_zone_margin = st.slider("Top2 zone margin trigger", 0.0, 50.0, 5.0, step=0.5)
+    top2_risk_threshold = st.slider("Require Top2 if risk score >=", 0, 12, 3, step=1)
+
+    st.header("Operational Display")
+    play_policy = st.selectbox(
+        "Play recommendation policy",
+        [
+            "Full capture: Top1+Top2 shown as recommended",
+            "Top2 risk gate: Top2 only when TOP2_REQUIRED",
+            "Top1 only: cheapest baseline",
+        ],
+        index=0,
+    )
+    recommended_top_n = st.slider("Recommended stream Top-N marker", 5, 78, 50, step=1)
+    row_pct_cutoff = st.slider("Recommended row percentile marker", 5, 100, 60, step=5)
+
+    st.header("Rare Top3 Rescue")
+    enable_top3_rescue = st.checkbox("Enable rare Top3 rescue for miss/outlier rows", value=True)
+    top3_rescue_min_score = st.slider("Top3 rescue minimum score", 1, 10, 3, step=1)
+
+    st.header("Row-Based Play Type Model")
+    enable_row_playtype_model = st.checkbox("Enable row-based play-type model", value=True)
+    row_model_min_hits = st.slider("Row model minimum historical hits", 1, 12, 4, step=1)
+    row_top3_rate_threshold = st.slider("TOP3 row threshold", 0.05, 0.60, 0.25, step=0.05)
+    row_top2_rate_threshold = st.slider("TOP2 row threshold", 0.05, 0.80, 0.35, step=0.05)
+    row_low_top2_rate_threshold = st.slider("TOP1-only if Top2 rate below", 0.00, 0.50, 0.35, step=0.05)
+    row_top1_rate_threshold = st.slider("TOP1-only row threshold", 0.30, 1.00, 0.70, step=0.05)
+
+    st.header("Universal Score Weights")
+    w_model = st.slider("Universal weight: model confidence", 0.0, 1.0, 0.45, step=0.05)
+    w_row = st.slider("Universal weight: row percentile", 0.0, 1.0, 0.25, step=0.05)
+    w_density = st.slider("Universal weight: stream density", 0.0, 1.0, 0.20, step=0.05)
+    w_outlier = st.slider("Universal penalty: miss/outlier risk", 0.0, 1.0, 0.10, step=0.05)
+
+    truth_min_rate = st.slider("Truth-mined min rate", 0.50, 0.95, 0.76, step=0.01)
+    truth_min_support = st.slider("Truth-mined min support", 1, 25, 5)
+
+    st.header("Straight Play Generator")
+    straight_recommended_only = st.checkbox("Straight generator: recommended streams only", value=True)
+    straight_top2_ratio_min = st.slider("Straight Top2 eligible if ratio >=", 0.00, 1.00, 0.35, step=0.05)
+    straight_top2_margin_max = st.slider("Straight Top2 eligible if margin <=", 0.0, 100.0, 25.0, step=1.0)
+    straight_top2_volatility_min = st.slider("Straight Top2 eligible if row volatility >=", 0.00, 1.00, 0.50, step=0.05)
+    straight_top3_margin_max = st.slider("Straight Top3 eligible if margin <=", 0.0, 100.0, 35.0, step=1.0)
+    straight_top3_volatility_min = st.slider("Straight Top3 requires row volatility >=", 0.00, 1.00, 0.50, step=0.05)
+    straight_max_per_stream = st.slider("Recommended straight plays per stream", 1, 5, 2, step=1)
+
+tab_daily, tab_lab, tab_stream, tab_straight, tab_v53, tab_v54, tab_straight_backtest, tab_help = st.tabs(["Daily Prediction", "Walk-forward Lab", "Stream / Row Tests", "Straight Plays", "v53 Trait Optimizer", "v55 Final Playlist", "Straight Backtest", "Notes"])
+
+if hist_file is None:
+    st.info("Upload FULL HISTORY to begin.")
+    st.stop()
+
+try:
+    hist_base_raw = cached_normalize_history_bytes(hist_file.getvalue(), hist_file.name)
+    last24_raw = cached_normalize_history_bytes(last24_file.getvalue(), last24_file.name) if last24_file is not None else None
+    hist_raw = combine_history_with_optional_24h(hist_base_raw, last24_raw)
+    hist = hist_raw.copy()
+except Exception as e:
+    st.error(f"Could not load/merge history files: {e}")
+    st.stop()
+
+hist_base_meta = dataset_meta(hist_base_raw)
+hist_24h_meta = dataset_meta(last24_raw) if last24_file is not None else {"rows": 0, "streams": 0, "first_date": "", "last_date": ""}
+hist_combined_meta = dataset_meta(hist_raw)
+st.session_state["loaded_meta"] = {
+    "full_history_file": uploaded_file_meta(hist_file),
+    "last24_file": uploaded_file_meta(last24_file),
+    "full_history_rows": hist_base_meta.get("rows", 0),
+    "last24_rows": hist_24h_meta.get("rows", 0),
+    "combined_rows": hist_combined_meta.get("rows", 0),
+    "combined_streams": hist_combined_meta.get("streams", 0),
+    "combined_first_date": hist_combined_meta.get("first_date", "UNKNOWN"),
+    "combined_last_date": hist_combined_meta.get("last_date", "UNKNOWN"),
+}
+
+# Component-specific lookback. The uploaded/merged full history is preserved; selected model window controls scoring.
+hist = apply_history_lookback(hist, box_lookback_choice)
+
+try:
+    truth = cached_load_truth_bytes(truth_file.getvalue(), truth_file.name) if truth_file is not None else None
+    lib = cached_load_library_bytes(lib_file.getvalue(), lib_file.name) if lib_file is not None else None
+except Exception as e:
+    st.error(f"Could not load truth/library file: {e}")
+    st.stop()
+
+stream_diag, kept_streams = stream_reduction(hist, window_days, prune_pct)
+stream_diag = assign_stream_tiers(stream_diag)
+stream_diag = add_stream_selection_flags(stream_diag, recommended_top_n, row_pct_cutoff)
+# v49.5 CONTROLLED EXECUTION NOTE:
+# Do NOT deep-mine truth rules on page load. That was the source of slow/blank loads.
+# Heavy truth mining runs only behind the Daily/Lab buttons.
+rules = pd.DataFrame(columns=["pair", "trait_stack", "winner_member", "winner_rate", "support", "pair_gap", "stack_size"])
+new_truth_rules = pd.DataFrame(columns=rules.columns)
+if lib is not None:
+    rules = pd.concat([rules, lib], ignore_index=True)
+
+
+def build_active_rules_for_run(truth_df: Optional[pd.DataFrame], lib_df: Optional[pd.DataFrame], min_rate: float, min_support: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    base_cols = ["pair", "trait_stack", "winner_member", "winner_rate", "support", "pair_gap", "stack_size"]
+    active = pd.DataFrame(columns=base_cols)
+    mined = pd.DataFrame(columns=base_cols)
+    if lib_df is not None and not lib_df.empty:
+        active = pd.concat([active, lib_df], ignore_index=True)
+    if truth_df is not None and not truth_df.empty:
+        truth_enriched = enrich_seed_features(truth_df, "seed")
+        mined = deep_mine_separators(truth_enriched, min_rate, min_support)
+        if not mined.empty:
+            active = pd.concat([active, mined], ignore_index=True)
+    return active, mined
+
+with tab_daily:
+    st.subheader("Daily 025 prediction playlist")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("History rows", f"{len(hist):,}")
+    c2.metric("Streams", hist["StreamKey"].nunique())
+    c3.metric("Kept streams", len(kept_streams))
+    c4.metric("Loaded base rules", len(rules))
+    global_last_draw = pd.to_datetime(hist_raw["Date"], errors="coerce").max() if not hist_raw.empty else pd.NaT
+    model_last_draw = pd.to_datetime(hist["Date"], errors="coerce").max() if not hist.empty else pd.NaT
+    meta = st.session_state.get("loaded_meta", {}) or {}
+    st.info(
+        f"Data Last Draw (Combined Global): {global_last_draw.date() if pd.notna(global_last_draw) else 'UNKNOWN'} | "
+        f"Model Window Last Draw: {model_last_draw.date() if pd.notna(model_last_draw) else 'UNKNOWN'} | "
+        f"24h File Loaded: {'YES' if last24_file is not None else 'NO'} | "
+        f"Combined Rows: {meta.get('combined_rows', len(hist_raw)):,} | "
+        f"Box Lookback: {box_lookback_choice} | Straight Lookback: {straight_lookback_days} days | Recent Straight Window: {straight_recent_window} draws"
+    )
+    with st.expander("Loaded file/cache metadata", expanded=False):
+        st.json(meta)
+    st.caption(f"Recommended stream marker: Top-N={recommended_top_n}, Row percentile cutoff={row_pct_cutoff}%. All streams still remain visible.")
+
+    if lib is None:
+        st.warning("Upload promoted separator library for v22/v31-style member scoring.")
+    if truth is None:
+        st.warning("Upload FULL TRUTH file if you want live truth-mined intelligence layer active.")
+
+    if st.button("Run Daily Prediction", type="primary", use_container_width=True, key="daily_run"):
+        status = st.status("Running daily prediction...", expanded=True)
+        prog = st.progress(0, text="Building active rules only for this run")
+        rules, new_truth_rules = build_active_rules_for_run(truth, lib, truth_min_rate, truth_min_support)
+        prog.progress(10, text=f"Active rules ready: {len(rules):,}")
+        live_rows = build_live_seed_rows(hist, kept_streams)
+        prog.progress(35, text="Scoring members")
+        scored = []
+        for _, row in live_rows.iterrows():
+            pick = v22_pick(row, rules, trait_weight, min_margin, enable_margin_swap, top2_zone_ratio, top2_zone_margin, top2_risk_threshold) if not rules.empty else {
+                "PredictedMember": "0025", "Top2_pred": "0225", "Margin": 0.0, "Fired_Rules": "",
+                "GATED_TOP3": 0, "score_0025": 0, "score_0225": 0, "score_0255": 0
+            }
+            scored.append({**row.to_dict(), **pick})
+        playlist = pd.DataFrame(scored)
+        if not playlist.empty:
+            merge_cols = [c for c in [
+                "StreamKey", "hit_density", "rank", "StreamRank", "kept", "RowPercentile",
+                "SingleRow", "RowBucket10", "StreamTier", "RecommendedByTopN",
+                "RecommendedByRowPct", "RecommendedStream"
+            ] if c in stream_diag.columns]
+            playlist = playlist.merge(stream_diag[merge_cols], on="StreamKey", how="left")
+            playlist = add_rare_top3_and_universal_scores(
+                playlist, enable_top3_rescue, top3_rescue_min_score,
+                w_model, w_row, w_density, w_outlier
+            )
+            row_model_df = build_row_play_model(
+                st.session_state.get("row_single_perf"),
+                row_model_min_hits,
+                row_top3_rate_threshold,
+                row_top2_rate_threshold,
+                row_top1_rate_threshold,
+                row_low_top2_rate_threshold,
+            )
+            st.session_state["row_play_model"] = row_model_df
+            playlist = apply_row_playtype_model(playlist, row_model_df, enable_row_playtype_model)
+            playlist = apply_play_recommendation(playlist, play_policy)
+            playlist = add_data_freshness_columns(playlist, hist)
+            playlist = add_seed_play_overlay(playlist, enable_seed_play_overlay)
+            playlist = playlist.sort_values(["RecommendedStream", "UniversalFamilyScore", "hit_density", "Margin"], ascending=[False, False, False, False]).reset_index(drop=True)
+            playlist["PlaylistRank"] = playlist.index + 1
+            playlist["margin_percentile"] = playlist["Margin"].rank(pct=True, method="average").round(4)
+            front_cols = [
+                "PlaylistRank", "RecommendedStream", "SeedPlayTier", "SeedPlayReason", "SeedPlayRecommended", "Data_Last_Draw_Date", "Stream_Last_Draw_Date", "Seed_Date", "Days_Since_Stream_Update", "Stale_Stream_Flag", "Prediction_Run_Timestamp", "StreamRank", "RowPercentile", "SingleRow", "StreamTier",
+                "StreamKey", "State", "Game", "LastResult", "UniversalFamilyScore", "PlayType", "RecommendedPlay",
+                "Top1_Display", "Top2_Display", "Top3_Display", "PredictedMember", "Top2_pred", "ThirdMember",
+                "Top3Rescue", "Top3RescueScore", "Top3RescueReasons",
+                "RowPlayType", "RowPlayTypeReason", "RowModelHits", "RowTop1Rate", "RowTop2Rate", "RowTop3Rate", "RowLowTop2Threshold",
+                "Margin", "Top2ToTop1Ratio",
+                "Top2Zone", "Top2RiskScore", "Top2Decision", "Top2RiskReasons", "DecisionMode",
+                "score_0025", "score_0225", "score_0255", "ModelConfidenceScore",
+                "RowStrengthScore", "FamilyHitDensityScore", "MissOutlierRiskScore", "hit_density", "Fired_Rules"
+            ]
+            playlist = playlist[[c for c in front_cols if c in playlist.columns] + [c for c in playlist.columns if c not in front_cols]]
+        st.session_state["daily_playlist"] = playlist
+        prog.progress(100, text="Done")
+        status.update(label="Daily prediction complete", state="complete", expanded=False)
+
+    if st.session_state["daily_playlist"] is not None:
+        playlist = st.session_state["daily_playlist"]
+        st.subheader("Visible Daily Playlist")
+        if playlist.empty:
+            st.warning("Daily playlist is empty after current filters.")
+        else:
+            st.dataframe(playlist, use_container_width=True, hide_index=True)
+        a, b = st.columns(2)
+        with a:
+            st.download_button("Download Daily Playlist CSV", playlist.to_csv(index=False).encode("utf-8"), "daily_playlist__core025_northern_lights_v50.csv", "text/csv", use_container_width=True, on_click="ignore",
+            key="dl_v47_0_download_daily_playlist_csv"
+        )
+        with b:
+            st.download_button("Download Daily Playlist TXT", playlist.to_csv(index=False).encode("utf-8"), "daily_playlist__core025_northern_lights_v50.txt", "text/plain", use_container_width=True, on_click="ignore",
+            key="dl_v47_1_download_daily_playlist_txt"
+        )
+
+    with st.expander("Stream reduction table", expanded=False):
+        st.dataframe(stream_diag, use_container_width=True, hide_index=True)
+
+with tab_lab:
+    st.subheader("Walk-forward lab on uploaded history")
+    if st.button("Run Walk-forward Lab", type="primary", use_container_width=True, key="lab_run"):
+        status = st.status("Running walk-forward lab...", expanded=True)
+        prog = st.progress(0, text="Building active rules only for this run")
+        rules, new_truth_rules = build_active_rules_for_run(truth, lib, truth_min_rate, truth_min_support)
+        prog.progress(10, text=f"Active rules ready: {len(rules):,}")
+        prog.progress(20, text="Building event rows")
+        lab_rows = build_lab_event_rows(hist)
+        prog.progress(35, text="Applying stream reduction")
+        lab_rows = lab_rows[lab_rows["StreamKey"].isin(kept_streams)].copy()
+        scored = []
+        prog.progress(60, text="Scoring rows")
+        for _, row in lab_rows.iterrows():
+            pick = v22_pick(row, rules, trait_weight, min_margin, enable_margin_swap, top2_zone_ratio, top2_zone_margin, top2_risk_threshold) if not rules.empty else {
+                "PredictedMember": "0025", "Top2_pred": "0225", "Margin": 0.0, "Fired_Rules": "",
+                "GATED_TOP3": 0, "score_0025": 0, "score_0225": 0, "score_0255": 0
+            }
+            top1 = int(pick["PredictedMember"] == row["TrueMember"])
+            top2_needed = int(top1 == 0 and pick["Top2_pred"] == row["TrueMember"])
+            miss = int(top1 == 0 and top2_needed == 0)
+            scored.append({**row.to_dict(), **pick, "Top1_Correct": top1, "Needed_Top2": top2_needed, "Miss": miss})
+        res = pd.DataFrame(scored)
+        if not res.empty:
+            merge_cols = [c for c in [
+                "StreamKey", "hit_density", "rank", "StreamRank", "kept", "RowPercentile",
+                "SingleRow", "RowBucket10", "StreamTier", "RecommendedByTopN",
+                "RecommendedByRowPct", "RecommendedStream"
+            ] if c in stream_diag.columns]
+            res = res.merge(stream_diag[merge_cols], on="StreamKey", how="left")
+            res = add_rare_top3_and_universal_scores(
+                res, enable_top3_rescue, top3_rescue_min_score,
+                w_model, w_row, w_density, w_outlier
+            )
+            row_model_df = build_row_play_model(
+                st.session_state.get("row_single_perf"),
+                row_model_min_hits,
+                row_top3_rate_threshold,
+                row_top2_rate_threshold,
+                row_top1_rate_threshold,
+                row_low_top2_rate_threshold,
+            )
+            st.session_state["row_play_model"] = row_model_df
+            res = apply_row_playtype_model(res, row_model_df, enable_row_playtype_model)
+            res = apply_play_recommendation(res, play_policy)
+        total = len(res)
+        top1 = int(res["Top1_Correct"].sum()) if total else 0
+        needed = int(res["Needed_Top2"].sum()) if total else 0
+        miss = int(res["Miss"].sum()) if total else 0
+        capture = (top1 + needed) / total * 100 if total else 0.0
+
+        operational_top2_capture = int(((res["Needed_Top2"] == 1) & (res["PlayType"].isin(["TOP1_TOP2", "TOP1_TOP2_TOP3"]))).sum()) if total and "PlayType" in res.columns else 0
+        operational_top3_capture = int(((res["Miss"] == 1) & (res["PlayType"] == "TOP1_TOP2_TOP3")).sum()) if total and "PlayType" in res.columns else 0
+        operational_captured = top1 + operational_top2_capture + operational_top3_capture
+        operational_capture_pct = (operational_captured / total * 100) if total else 0.0
+        operational_plays = 0
+        if total and "PlayType" in res.columns:
+            operational_plays = int((res["PlayType"] == "TOP1_ONLY").sum() + 2*(res["PlayType"] == "TOP1_TOP2").sum() + 3*(res["PlayType"] == "TOP1_TOP2_TOP3").sum())
+        summary = pd.DataFrame([{
+            "total_rows": total,
+            "top1": top1,
+            "top1_pct": round((top1 / total * 100), 2) if total else 0.0,
+            "needed_top2": needed,
+            "top2_burden_pct": round((needed / total * 100), 2) if total else 0.0,
+            "miss": miss,
+            "capture_pct": round(capture, 2),
+            "operational_captured": operational_captured,
+            "operational_capture_pct": round(operational_capture_pct, 2),
+            "operational_plays": operational_plays,
+            "operational_plays_per_capture": round(operational_plays / operational_captured, 3) if operational_captured else None,
+            "top3_rescue_rows": int(res["Top3Rescue"].sum()) if total and "Top3Rescue" in res.columns else 0,
+            "top3_rescue_captured_misses": operational_top3_capture,
+            "gated_top3": int(res["GATED_TOP3"].sum()) if total else 0,
+            "margin_swaps": int(res["MarginSwap"].sum()) if total and "MarginSwap" in res.columns else 0,
+            "top2_zone_rows": int(res["Top2Zone"].sum()) if total and "Top2Zone" in res.columns else 0,
+            "top2_required_rows": int((res["Top2Decision"] == "TOP2_REQUIRED").sum()) if total and "Top2Decision" in res.columns else 0,
+            "top2_safe_rows": int((res["Top2Decision"] == "TOP1_SAFE").sum()) if total and "Top2Decision" in res.columns else 0,
+            "kept_streams": len(kept_streams),
+            "active_rules": len(rules),
+            "truth_mined_rules": len(new_truth_rules),
+            "decision_layer": "strict_score_ranking_no_third_hijack",
+            "margin_swap_enabled": enable_margin_swap,
+            "play_policy": play_policy,
+            "recommended_stream_rows": int(res["RecommendedStream"].sum()) if total and "RecommendedStream" in res.columns else 0,
+            "row_playtype_model_enabled": enable_row_playtype_model,
+            "row_model_min_hits": row_model_min_hits,
+            "row_top3_rate_threshold": row_top3_rate_threshold,
+            "row_top2_rate_threshold": row_top2_rate_threshold,
+            "row_low_top2_rate_threshold": row_low_top2_rate_threshold,
+            "row_top1_rate_threshold": row_top1_rate_threshold,
+            "row_model_top1_only_rows": int((res["PlayType"] == "TOP1_ONLY").sum()) if total and "PlayType" in res.columns else 0,
+            "row_model_top1_top2_rows": int((res["PlayType"] == "TOP1_TOP2").sum()) if total and "PlayType" in res.columns else 0,
+            "row_model_top1_top2_top3_rows": int((res["PlayType"] == "TOP1_TOP2_TOP3").sum()) if total and "PlayType" in res.columns else 0,
+        }])
+        method_tests, single_row_perf = build_stream_method_tests(res, play_policy)
+        pct = res.copy()
+        if not pct.empty:
+            pct["margin_percentile"] = pct["Margin"].rank(pct=True, method="average").round(4)
+        st.session_state["lab_results"] = res
+        st.session_state["lab_summary"] = summary
+        st.session_state["percentile_df"] = pct
+        st.session_state["stream_method_tests"] = method_tests
+        st.session_state["row_single_perf"] = single_row_perf
+        prog.progress(100, text="Done")
+        status.update(label="Walk-forward lab complete", state="complete", expanded=False)
+
+    if st.session_state["lab_summary"] is not None:
+        summary = st.session_state["lab_summary"]
+        res = st.session_state["lab_results"]
+        pct = st.session_state["percentile_df"]
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+        if not res.empty:
+            front_cols = [
+                "StreamKey", "StreamRank", "RowPercentile", "SingleRow", "StreamTier", "RecommendedStream",
+                "Date", "seed", "Result", "TrueMember", "UniversalFamilyScore", "PlayType", "RecommendedPlay",
+                "PredictedMember", "Top2_pred", "ThirdMember", "Top3Rescue", "Top3RescueScore",
+                "Top3RescueReasons", "RowPlayType", "RowPlayTypeReason", "RowModelHits",
+                "RowTop1Rate", "RowTop2Rate", "RowTop3Rate",
+                "Top1_Correct", "Needed_Top2", "Miss",
+                "Margin", "Top2ToTop1Ratio", "Top2Zone", "Top2RiskScore", "Top2Decision",
+                "Top2RiskReasons", "DecisionMode", "MarginSwap",
+                "score_0025", "score_0225", "score_0255", "Fired_Rules"
+            ]
+            res_view = res[[c for c in front_cols if c in res.columns] + [c for c in res.columns if c not in front_cols]]
+        else:
+            res_view = res
+        st.dataframe(res_view, use_container_width=True, hide_index=True)
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.download_button("Download Lab Summary CSV", summary.to_csv(index=False).encode("utf-8"), "lab_summary__core025_northern_lights_v50.csv", "text/csv", use_container_width=True, on_click="ignore",
+            key="dl_v47_2_download_lab_summary_csv"
+        )
+            st.download_button("Download Lab Summary TXT", summary.to_csv(index=False).encode("utf-8"), "lab_summary__core025_northern_lights_v50.txt", "text/plain", use_container_width=True, on_click="ignore",
+            key="dl_v47_3_download_lab_summary_txt"
+        )
+        with c2:
+            st.download_button("Download Lab Per Event CSV", res.to_csv(index=False).encode("utf-8"), "lab_per_event__core025_northern_lights_v50.csv", "text/csv", use_container_width=True, on_click="ignore",
+            key="dl_v47_4_download_lab_per_event_csv"
+        )
+            st.download_button("Download Lab Per Event TXT", res.to_csv(index=False).encode("utf-8"), "lab_per_event__core025_northern_lights_v50.txt", "text/plain", use_container_width=True, on_click="ignore",
+            key="dl_v47_5_download_lab_per_event_txt"
+        )
+        with c3:
+            st.download_button("Download Percentile CSV", pct.to_csv(index=False).encode("utf-8"), "percentile_list__core025_northern_lights_v50.csv", "text/csv", use_container_width=True, on_click="ignore",
+            key="dl_v47_6_download_percentile_csv"
+        )
+            st.download_button("Download Stream Method Tests CSV", st.session_state["stream_method_tests"].to_csv(index=False).encode("utf-8") if st.session_state["stream_method_tests"] is not None else b"", "stream_method_tests__core025_northern_lights_v50.csv", "text/csv", use_container_width=True, on_click="ignore",
+            key="dl_v47_7_download_stream_method_tests_csv"
+        )
+        with c4:
+            st.download_button("Download Stream Reduction CSV", stream_diag.to_csv(index=False).encode("utf-8"), "stream_reduction__core025_northern_lights_v50.csv", "text/csv", use_container_width=True, on_click="ignore",
+            key="dl_v47_8_download_stream_reduction_csv"
+        )
+            st.download_button("Download Single Row Perf CSV", st.session_state["row_single_perf"].to_csv(index=False).encode("utf-8") if st.session_state["row_single_perf"] is not None else b"", "single_row_performance__core025_northern_lights_v50.csv", "text/csv", use_container_width=True, on_click="ignore",
+            key="dl_v47_9_download_single_row_perf_csv"
+        )
+
+
+with tab_stream:
+    st.subheader("Stream / Row-Based Percentile Testing")
+    st.caption("This tab keeps all streams visible but tests which row bands, single rows, and stream-selection methods historically performed best. It does not change the baseline unless you choose to use its output operationally.")
+
+    st.markdown("### Current stream list with row-based percentile scoring")
+    st.dataframe(stream_diag, use_container_width=True, hide_index=True)
+
+    if st.session_state["stream_method_tests"] is not None:
+        st.markdown("### Method comparison")
+        st.dataframe(st.session_state["stream_method_tests"], use_container_width=True, hide_index=True)
+
+    if st.session_state["row_single_perf"] is not None:
+        st.markdown("### Single-row performance")
+        st.dataframe(st.session_state["row_single_perf"], use_container_width=True, hide_index=True)
+
+    if st.session_state["row_play_model"] is not None:
+        st.markdown("### Row Play-Type Model")
+        st.dataframe(st.session_state["row_play_model"], use_container_width=True, hide_index=True)
+
+    st.markdown("### Stream / Row Test Downloads")
+    stream_tests_ready = st.session_state["stream_method_tests"] is not None
+    single_rows_ready = st.session_state["row_single_perf"] is not None
+    pct_ready = st.session_state["percentile_df"] is not None
+
+    d1, d2, d3, d4 = st.columns(4)
+    with d1:
+        st.download_button(
+            "Download Stream Method Tests CSV",
+            st.session_state["stream_method_tests"].to_csv(index=False).encode("utf-8") if stream_tests_ready else b"",
+            "stream_method_tests__core025_northern_lights_v50.csv",
+            "text/csv",
+            use_container_width=True,
+            on_click="ignore",
+            disabled=not stream_tests_ready,
+            key="dl_v47_10_download_stream_method_tests_csv"
+        )
+        st.download_button(
+            "Download Stream Method Tests TXT",
+            st.session_state["stream_method_tests"].to_csv(index=False).encode("utf-8") if stream_tests_ready else b"",
+            "stream_method_tests__core025_northern_lights_v50.txt",
+            "text/plain",
+            use_container_width=True,
+            on_click="ignore",
+            disabled=not stream_tests_ready,
+            key="dl_v47_11_download_stream_method_tests_txt"
+        )
+    with d2:
+        st.download_button(
+            "Download Single Row Performance CSV",
+            st.session_state["row_single_perf"].to_csv(index=False).encode("utf-8") if single_rows_ready else b"",
+            "single_row_performance__core025_northern_lights_v50.csv",
+            "text/csv",
+            use_container_width=True,
+            on_click="ignore",
+            disabled=not single_rows_ready,
+            key="dl_v47_12_download_single_row_performance_csv"
+        )
+        st.download_button(
+            "Download Single Row Performance TXT",
+            st.session_state["row_single_perf"].to_csv(index=False).encode("utf-8") if single_rows_ready else b"",
+            "single_row_performance__core025_northern_lights_v50.txt",
+            "text/plain",
+            use_container_width=True,
+            on_click="ignore",
+            disabled=not single_rows_ready,
+            key="dl_v47_13_download_single_row_performance_txt"
+        )
+    with d3:
+        st.download_button(
+            "Download Percentile List CSV",
+            st.session_state["percentile_df"].to_csv(index=False).encode("utf-8") if pct_ready else b"",
+            "percentile_list__core025_northern_lights_v50.csv",
+            "text/csv",
+            use_container_width=True,
+            on_click="ignore",
+            disabled=not pct_ready,
+            key="dl_v47_14_download_percentile_list_csv"
+        )
+        st.download_button(
+            "Download Percentile List TXT",
+            st.session_state["percentile_df"].to_csv(index=False).encode("utf-8") if pct_ready else b"",
+            "percentile_list__core025_northern_lights_v50.txt",
+            "text/plain",
+            use_container_width=True,
+            on_click="ignore",
+            disabled=not pct_ready,
+            key="dl_v47_15_download_percentile_list_txt"
+        )
+    with d4:
+        st.download_button(
+            "Download Stream Reduction CSV",
+            stream_diag.to_csv(index=False).encode("utf-8"),
+            "stream_reduction__core025_northern_lights_v50.csv",
+            "text/csv",
+            use_container_width=True,
+            on_click="ignore",
+            key="dl_v47_16_download_stream_reduction_csv"
+        )
+        st.download_button(
+            "Download Stream Reduction TXT",
+            stream_diag.to_csv(index=False).encode("utf-8"),
+            "stream_reduction__core025_northern_lights_v50.txt",
+            "text/plain",
+            use_container_width=True,
+            on_click="ignore",
+            key="dl_v47_17_download_stream_reduction_txt"
+        )
+
+    row_model_ready = st.session_state["row_play_model"] is not None
+    d5, _ = st.columns([1, 3])
+    with d5:
+        st.download_button(
+            "Download Row Play Model CSV",
+            st.session_state["row_play_model"].to_csv(index=False).encode("utf-8") if row_model_ready else b"",
+            "row_play_model__core025_northern_lights_v50.csv",
+            "text/csv",
+            use_container_width=True,
+            on_click="ignore",
+            disabled=not row_model_ready,
+            key="dl_v47_stream_tab_row_play_model_csv",
+        )
+
+    if not stream_tests_ready:
+        st.info("Stream Method, Single Row, and Percentile downloads unlock after Walk-forward Lab runs in this app session. Stream Reduction is downloadable immediately.")
+
+
+with tab_straight:
+    st.subheader("Straight Play Generator — v47")
+    st.caption("Box engine remains v46. This layer applies stricter straight eligibility, then ranks actual straight permutations from historical order behavior.")
+
+    if st.session_state["daily_playlist"] is None:
+        st.warning("Run Daily Prediction first. The straight generator uses the current v46 daily playlist, then applies stricter straight eligibility.")
+    else:
+        playlist = st.session_state["daily_playlist"]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Daily playlist rows", f"{len(playlist):,}")
+        c2.metric("Recommended-only mode", "ON" if straight_recommended_only else "OFF")
+        c3.metric("Top straights/stream", straight_max_per_stream)
+        c4.metric("Unique perms/member", "12")
+
+        if st.button("Run Straight Play Generator", type="primary", use_container_width=True, key="straight_run"):
+            status = st.status("Running straight play generator...", expanded=True)
+            straight_df, straight_summary = build_straight_playlist(
+                playlist,
+                hist,
+                straight_recommended_only,
+                straight_top2_ratio_min,
+                straight_top2_margin_max,
+                straight_top2_volatility_min,
+                straight_top3_margin_max,
+                straight_top3_volatility_min,
+                straight_max_per_stream,
+                int(straight_lookback_days),
+                int(straight_recent_window),
+            )
+            st.session_state["straight_playlist"] = straight_df
+            st.session_state["straight_summary"] = straight_summary
+            status.update(label="Straight play generation complete", state="complete", expanded=False)
+
+    if st.session_state["straight_playlist"] is not None:
+        straight_df = st.session_state["straight_playlist"]
+        straight_summary = st.session_state["straight_summary"]
+        if straight_df.empty:
+            st.warning("No straight candidates were produced. Check that Daily Prediction has rows and that the history contains Core025 straight events.")
+        else:
+            a, b, c, d = st.columns(4)
+            a.metric("Candidate straights", f"{len(straight_df):,}")
+            b.metric("Recommended straights", f"{int(straight_df['RecommendedStraight'].sum()):,}")
+            c.metric("Eligible streams", f"{straight_df['StreamKey'].nunique():,}")
+            d.metric("Avg candidates/stream", round(len(straight_df) / max(1, straight_df['StreamKey'].nunique()), 2))
+
+            st.markdown("### Stream-level straight summary")
+            st.dataframe(straight_summary, use_container_width=True, hide_index=True)
+
+            st.markdown("### Ranked straight permutations")
+            front_cols = [
+                "OverallStraightRank", "StreamStraightRank", "RecommendedStraight", "RecommendedStraightDisplay",
+                "StreamKey", "State", "Game", "seed", "LastResult", "StraightPermutation", "StraightMember",
+                "StraightMemberSource", "StraightEligibilityReason", "StraightConfidenceScore", "EvidenceSupport",
+                "MemberConfidenceScore", "PositionScore", "OrderedPairScore", "SeedTransitionScore",
+                "StreamOrderScore", "RecentOrderScore", "RepeatPlacementScore", "DupPattern",
+                "BoxPlayType", "BoxRecommendedPlay", "PredictedMember", "Top2_pred", "ThirdMember",
+                "Margin", "Top2ToTop1Ratio", "Top2RiskScore", "Top3Rescue", "RowVolatilityRate",
+                "StraightScoreFormula"
+            ]
+            straight_view = straight_df[[c for c in front_cols if c in straight_df.columns] + [c for c in straight_df.columns if c not in front_cols]]
+            st.dataframe(straight_view, use_container_width=True, hide_index=True)
+
+            dl1, dl2, dl3, dl4 = st.columns(4)
+            with dl1:
+                st.download_button(
+                    "Download Straight Ranked CSV",
+                    straight_df.to_csv(index=False).encode("utf-8"),
+                    "straight_ranked__core025_northern_lights_v50.csv",
+                    "text/csv",
+                    use_container_width=True,
+                    on_click="ignore",
+                    key="dl_v50_straight_ranked_csv",
+                )
+            with dl2:
+                st.download_button(
+                    "Download Straight Ranked TXT",
+                    straight_df.to_csv(index=False).encode("utf-8"),
+                    "straight_ranked__core025_northern_lights_v50.txt",
+                    "text/plain",
+                    use_container_width=True,
+                    on_click="ignore",
+                    key="dl_v50_straight_ranked_txt",
+                )
+            with dl3:
+                st.download_button(
+                    "Download Straight Summary CSV",
+                    straight_summary.to_csv(index=False).encode("utf-8"),
+                    "straight_summary__core025_northern_lights_v50.csv",
+                    "text/csv",
+                    use_container_width=True,
+                    on_click="ignore",
+                    key="dl_v50_straight_summary_csv",
+                )
+            with dl4:
+                recommended_only_df = straight_df[straight_df["RecommendedStraight"] == 1].copy()
+                st.download_button(
+                    "Download Recommended Straights CSV",
+                    recommended_only_df.to_csv(index=False).encode("utf-8"),
+                    "straight_recommended_only__core025_northern_lights_v50.csv",
+                    "text/csv",
+                    use_container_width=True,
+                    on_click="ignore",
+                    key="dl_v50_straight_recommended_only_csv",
+                )
+
+
+
+
+
+
+# ================================
+# v54 INTEGRATED STRUCTURED PREDICTOR HELPERS
+# ================================
+
+
+def v55_load_mined_reports_zip(uploaded_zip):
+    reports = {
+        "seed_trait_member": pd.DataFrame(),
+        "seed_position_member": pd.DataFrame(),
+        "double_position": pd.DataFrame(),
+        "seed_trait_double": pd.DataFrame(),
+        "position_map": pd.DataFrame(),
+        "same_position": pd.DataFrame(),
+    }
+    if uploaded_zip is None:
+        return reports
+    try:
+        with zipfile.ZipFile(io.BytesIO(uploaded_zip.getvalue()), "r") as zf:
+            names = zf.namelist()
+            wanted = {
+                "seed_trait_to_member.csv": "seed_trait_member",
+                "seed_position_digit_to_member.csv": "seed_position_member",
+                "double_position_summary.csv": "double_position",
+                "seed_trait_to_double_position.csv": "seed_trait_double",
+                "seed_position_to_winner_position_digit.csv": "position_map",
+                "same_position_seed_digit_to_winner_digit.csv": "same_position",
+            }
+            for fname, key in wanted.items():
+                matches = [n for n in names if n.endswith(fname)]
+                if matches:
+                    with zf.open(matches[0]) as f:
+                        reports[key] = pd.read_csv(f)
+    except Exception:
+        pass
+    return reports
+
+def v54_load_optional_csv(uploaded):
+    if uploaded is None:
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(uploaded)
+    except Exception:
+        return pd.DataFrame()
+
+def v54_normalize_seed_trait_to_member(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    if "WinMember" not in out.columns:
+        for c in out.columns:
+            if "member" in str(c).lower():
+                out = out.rename(columns={c: "WinMember"})
+                break
+    if "RatePct" not in out.columns and {"Hits", "Total"} <= set(out.columns):
+        out["RatePct"] = pd.to_numeric(out["Hits"], errors="coerce") / pd.to_numeric(out["Total"], errors="coerce") * 100
+    return out
+
+def v54_normalize_numeric(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    if "Hits" not in out.columns and "Count" in out.columns:
+        out = out.rename(columns={"Count": "Hits"})
+    for c in ["Hits", "Total", "RatePct"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0)
+    return out
+
+def v54_perm_member(perm):
+    b = "".join(sorted(str(perm).zfill(4)))
+    return b if b in {"0025","0225","0255"} else None
+
+def v54_double_positions(perm):
+    s = str(perm).zfill(4)
+    c = Counter(s)
+    doubles = [d for d,n in c.items() if n == 2]
+    if not doubles:
+        return "none"
+    d = doubles[0]
+    return "-".join(str(i+1) for i,x in enumerate(s) if x == d)
+
+def v54_score_member_layer(seed, perm, member_df, weight):
+    member = v54_perm_member(perm)
+    if member_df is None or member_df.empty or not member:
+        return 0.0, ""
+    vals = {}
+    if "v53_build_trait_tokens" in globals():
+        for t in v53_build_trait_tokens(seed):
+            if "=" in t:
+                k,v = t.split("=", 1)
+                vals[k] = v
+    boost = 0.0
+    matches = []
+    for _, r in member_df.iterrows():
+        if str(r.get("WinMember","")) != str(member):
+            continue
+        matched = False
+        if "Trait" in r and "TraitValue" in r:
+            matched = vals.get(str(r["Trait"])) == str(r["TraitValue"])
+        elif "SeedPos" in r and "SeedDigit" in r:
+            matched = vals.get(str(r["SeedPos"])) == str(r["SeedDigit"])
+        if matched:
+            rate = float(r.get("RatePct", 0) or 0)
+            total = float(r.get("Total", r.get("Hits", 0)) or 0)
+            sf = min(total / 20.0, 1.0) if total else 0.25
+            boost += (rate / 100.0) * float(weight) * sf
+            matches.append(f"{member}:{rate:.1f}% n={int(total)}")
+    return round(boost, 4), " | ".join(matches[:4])
+
+def v54_score_double_layer(seed, perm, double_df, seed_double_df, weight):
+    member = v54_perm_member(perm)
+    dp = v54_double_positions(perm)
+    boost = 0.0
+    matches = []
+    if double_df is not None and not double_df.empty and {"WinMember","DoublePositions"} <= set(double_df.columns):
+        sub = double_df[(double_df["WinMember"].astype(str)==str(member)) & (double_df["DoublePositions"].astype(str)==str(dp))]
+        for _, r in sub.iterrows():
+            rate = float(r.get("RatePct", 0) or 0)
+            total = float(r.get("Total", r.get("Hits", 0)) or 0)
+            sf = min(total / 20.0, 1.0) if total else 0.25
+            boost += (rate / 100.0) * float(weight) * sf
+            matches.append(f"global_double={dp}:{rate:.1f}%")
+    return round(boost, 4), " | ".join(matches[:4])
+
+def v54_score_position_layer(seed, perm, pos_df, same_df, weight):
+    if (pos_df is None or pos_df.empty) and (same_df is None or same_df.empty):
+        return 0.0, ""
+    all_df = pd.concat([d for d in [pos_df, same_df] if d is not None and not d.empty], ignore_index=True)
+    seed = str(seed).zfill(4)
+    perm = str(perm).zfill(4)
+    boost = 0.0
+    matches = []
+    for si in range(4):
+        for wi in range(4):
+            sub = pd.DataFrame()
+            if {"SeedPos","SeedDigit","WinnerPos","WinnerDigit"} <= set(all_df.columns):
+                sub = all_df[(all_df["SeedPos"].astype(str)==f"S{si+1}") & (all_df["SeedDigit"].astype(str)==seed[si]) & (all_df["WinnerPos"].astype(str)==f"W{wi+1}") & (all_df["WinnerDigit"].astype(str)==perm[wi])]
+            elif si == wi and {"Position","SeedDigitAtPosition","WinnerDigitAtSamePosition"} <= set(all_df.columns):
+                sub = all_df[(all_df["Position"].astype(str)==f"P{si+1}") & (all_df["SeedDigitAtPosition"].astype(str)==seed[si]) & (all_df["WinnerDigitAtSamePosition"].astype(str)==perm[wi])]
+            for _, r in sub.iterrows():
+                rate = float(r.get("RatePct", 0) or 0)
+                total = float(r.get("Total", r.get("Hits", 0)) or 0)
+                if rate <= 0:
+                    continue
+                sf = min(total / 25.0, 1.0) if total else 0.25
+                boost += (rate / 100.0) * float(weight) * sf / 4.0
+                matches.append(f"S{si+1}{seed[si]}->W{wi+1}{perm[wi]}:{rate:.1f}%")
+    return round(boost, 4), " | ".join(matches[:6])
+
+
+# ================================
+# v59 GUARDED STRAIGHT ELIMINATION
+# ================================
+
+def v59_get_seed_trait_values_from_tokens(seed):
+    vals = {}
+    if "v53_build_trait_tokens" in globals():
+        for tok in v53_build_trait_tokens(seed):
+            if "=" in str(tok):
+                k, v = str(tok).split("=", 1)
+                vals[k] = v
+    return vals
+
+def v59_candidate_member_support(seed, seed_member_df, seed_pos_member_df):
+    support = Counter()
+    vals = v59_get_seed_trait_values_from_tokens(seed)
+    member_tables = [d for d in [seed_member_df, seed_pos_member_df] if d is not None and not d.empty]
+    if not member_tables:
+        return support
+    df = pd.concat(member_tables, ignore_index=True)
+    for _, r in df.iterrows():
+        member = str(r.get("WinMember", ""))
+        if member not in {"0025", "0225", "0255"}:
+            continue
+        matched = False
+        if "Trait" in r and "TraitValue" in r:
+            matched = vals.get(str(r["Trait"])) == str(r["TraitValue"])
+        elif "SeedPos" in r and "SeedDigit" in r:
+            matched = vals.get(str(r["SeedPos"])) == str(r["SeedDigit"])
+        if matched:
+            hits = float(r.get("Hits", 0) or 0)
+            rate = float(r.get("RatePct", 0) or 0)
+            total = float(r.get("Total", 0) or 0)
+            support[member] += hits + (rate / 100.0) * min(total, 20)
+    return support
+
+def v59_candidate_double_support(seed, member, seed_double_df, double_pos_df):
+    support = Counter()
+    vals = v59_get_seed_trait_values_from_tokens(seed)
+    if double_pos_df is not None and not double_pos_df.empty and {"WinMember", "DoublePositions"} <= set(double_pos_df.columns):
+        sub = double_pos_df[double_pos_df["WinMember"].astype(str).eq(str(member))]
+        for _, r in sub.iterrows():
+            pos = str(r.get("DoublePositions", ""))
+            hits = float(r.get("Hits", 0) or 0)
+            rate = float(r.get("RatePct", 0) or 0)
+            total = float(r.get("Total", 0) or 0)
+            support[pos] += hits + (rate / 100.0) * min(total, 20)
+
+    if seed_double_df is not None and not seed_double_df.empty and {"WinMember", "DoublePositions"} <= set(seed_double_df.columns):
+        sub = seed_double_df[seed_double_df["WinMember"].astype(str).eq(str(member))]
+        for _, r in sub.iterrows():
+            trait = str(r.get("Trait", ""))
+            val = str(r.get("TraitValue", ""))
+            if trait and vals.get(trait) == val:
+                pos = str(r.get("DoublePositions", ""))
+                hits = float(r.get("Hits", 0) or 0)
+                rate = float(r.get("RatePct", 0) or 0)
+                total = float(r.get("Total", 0) or 0)
+                support[pos] += hits + (rate / 100.0) * min(total, 20)
+    return support
+
+def v59_candidate_perm_support(seed, rules_df):
+    support = Counter()
+    if rules_df is None or rules_df.empty or "v53_build_trait_tokens" not in globals():
+        return support
+    tokens = set(v53_build_trait_tokens(seed))
+    for _, r in rules_df.head(5000).iterrows():
+        perm = str(r.get("TargetPermutation", "")).zfill(4)
+        stack = str(r.get("TraitStack", ""))
+        parts = [p.strip() for p in stack.split("&&")]
+        if parts and all(p in tokens for p in parts):
+            hits = float(r.get("Hits", 0) or 0)
+            score = float(r.get("RuleScore", 0) or 0)
+            lift = float(r.get("Lift", 0) or 0)
+            support[perm] += hits + score * 0.10 + lift * 0.25
+    return support
+
+def v59_top_keys(counter_obj, n, min_support):
+    if not counter_obj:
+        return set()
+    ranked = [(k, v) for k, v in counter_obj.most_common() if v >= min_support]
+    return {k for k, _ in ranked[:n]}
+
+def v59_apply_guarded_elimination(straight_df, rules_df, seed_member_df, seed_pos_member_df, double_pos_df, seed_double_df):
+    if straight_df is None or straight_df.empty or not V59_ENABLE_STRAIGHT_ELIMINATION:
+        out = straight_df.copy() if straight_df is not None else pd.DataFrame()
+        out["v59_Eliminated"] = 0
+        out["v59_EliminationReason"] = ""
+        return out
+
+    frames = []
+    for _, group in straight_df.groupby("PlaylistRank", sort=False):
+        g = group.copy()
+        seed = str(g["seed"].iloc[0]).zfill(4)
+
+        member_support = v59_candidate_member_support(seed, seed_member_df, seed_pos_member_df)
+        keep_members = v59_top_keys(member_support, V59_MEMBER_KEEP_TOP_N, V59_MIN_ELIMINATION_SUPPORT)
+
+        perm_support = v59_candidate_perm_support(seed, rules_df)
+        keep_perms = v59_top_keys(perm_support, V59_PERM_STACK_KEEP_TOP_N, V59_MIN_ELIMINATION_SUPPORT)
+
+        elim = []
+        reasons = []
+        for _, row in g.iterrows():
+            perm = str(row.get("StraightPermutation", "")).zfill(4)
+            member = v54_perm_member(perm) if "v54_perm_member" in globals() else "".join(sorted(perm))
+            dp = v54_double_positions(perm) if "v54_double_positions" in globals() else ""
+
+            row_elim = False
+            row_reasons = []
+
+            if keep_members and member not in keep_members:
+                row_elim = True
+                row_reasons.append(f"member_not_in_supported_top{V59_MEMBER_KEEP_TOP_N}")
+
+            double_support = v59_candidate_double_support(seed, member, seed_double_df, double_pos_df)
+            keep_double_pos = v59_top_keys(double_support, V59_DOUBLE_POSITION_KEEP_TOP_N, V59_MIN_ELIMINATION_SUPPORT)
+            if keep_double_pos and dp not in keep_double_pos:
+                row_elim = True
+                row_reasons.append(f"double_pos_not_in_supported_top{V59_DOUBLE_POSITION_KEEP_TOP_N}")
+
+            if keep_perms and perm not in keep_perms:
+                # only eliminate by exact-perm stack if enough exact support exists
+                row_elim = True
+                row_reasons.append(f"perm_not_in_supported_top{V59_PERM_STACK_KEEP_TOP_N}")
+
+            elim.append(1 if row_elim else 0)
+            reasons.append(";".join(row_reasons))
+
+        g["v59_Eliminated"] = elim
+        g["v59_EliminationReason"] = reasons
+
+        # Guardrail: never remove too many from one stream.
+        max_remove = int(len(g) * V59_ELIMINATION_MAX_REMOVE_PCT_PER_STREAM)
+        if int(g["v59_Eliminated"].sum()) > max_remove:
+            # keep highest base-score eliminations back in play until under cap
+            eliminated_idx = g[g["v59_Eliminated"].eq(1)].sort_values("StraightConfidenceScore", ascending=False).index
+            restore_count = int(g["v59_Eliminated"].sum()) - max_remove
+            restore_idx = eliminated_idx[:restore_count]
+            g.loc[restore_idx, "v59_Eliminated"] = 0
+            g.loc[restore_idx, "v59_EliminationReason"] = "RESTORED_BY_MAX_REMOVE_GUARD"
+
+        frames.append(g)
+
+    return pd.concat(frames, ignore_index=True) if frames else straight_df.copy()
+
+def v54_predict_structured(straight_df, rules_df, seed_member_df, seed_pos_member_df, double_pos_df, seed_double_df, pos_map_df, same_pos_df, member_weight, double_weight, pos_weight, stacked_weight, max_stack_boost):
+    if straight_df is None or straight_df.empty:
+        return pd.DataFrame()
+    member_tables = [d for d in [seed_member_df, seed_pos_member_df] if d is not None and not d.empty]
+    member_all = pd.concat(member_tables, ignore_index=True) if member_tables else pd.DataFrame()
+    rows = []
+    for _, row in straight_df.iterrows():
+        seed = str(row.get("seed","")).zfill(4)
+        perm = str(row.get("StraightPermutation","")).zfill(4)
+        base = float(row.get("StraightConfidenceScore", 0) or 0)
+        eliminated_flag = int(row.get("v59_Eliminated", 0) or 0)
+        elimination_penalty = -10000.0 if eliminated_flag else 0.0
+        mb, mm = v54_score_member_layer(seed, perm, member_all, member_weight)
+        db, dm = v54_score_double_layer(seed, perm, double_pos_df, seed_double_df, double_weight)
+        pb, pm = v54_score_position_layer(seed, perm, pos_map_df, same_pos_df, pos_weight)
+        sb, sh, sm = 0.0, 0, ""
+        if "v53_score_straights_with_rules" in globals():
+            tmp = v53_score_straights_with_rules(pd.DataFrame([row.to_dict()]), rules_df, rule_weight=stacked_weight, max_rule_boost=max_stack_boost)
+            if tmp is not None and not tmp.empty:
+                sb = float(tmp.iloc[0].get("TraitRuleBoost", 0))
+                sh = int(tmp.iloc[0].get("TraitRuleHits", 0))
+                sm = str(tmp.iloc[0].get("TraitRuleTopMatches", ""))
+        rr = row.to_dict()
+        rr.update({"v54_BaseStraightScore": base, "v54_MemberBoost": mb, "v54_MemberMatches": mm, "v54_DoublePositionBoost": db, "v54_DoublePositionMatches": dm, "v54_PositionMapBoost": pb, "v54_PositionMapMatches": pm, "v54_StackedRuleBoost": sb, "v54_StackedRuleHits": sh, "v54_StackedRuleMatches": sm, "v54_TotalPredictorScore": round(base + mb + db + pb + sb + elimination_penalty, 4), "v59_Eliminated": eliminated_flag, "v59_EliminationReason": row.get("v59_EliminationReason", "")})
+        rows.append(rr)
+    scored = pd.DataFrame(rows).sort_values(["PlaylistRank","v54_TotalPredictorScore","v54_StackedRuleHits","StraightConfidenceScore","StreamStraightRank"], ascending=[True,False,False,False,True]).copy()
+    scored["v54_StreamStraightRank"] = scored.groupby("PlaylistRank").cumcount() + 1
+    return scored
+
+def v54_sections(scored, stream_depth, best_depth, optional_depth):
+    if scored is None or scored.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    elig = scored[pd.to_numeric(scored.get("PlaylistRank",999), errors="coerce").fillna(999).le(stream_depth)].copy()
+    if "v59_Eliminated" in elig.columns:
+        playable_elig = elig[elig["v59_Eliminated"].fillna(0).astype(int).eq(0)].copy()
+    else:
+        playable_elig = elig.copy()
+    box = elig.sort_values("PlaylistRank").drop_duplicates("PlaylistRank").copy()
+    box["PlaylistSection"] = "BOX_PLAYS"
+    box_cols = [c for c in ["PlaylistSection","PlaylistRank","StreamKey","State","Game","seed","BoxPlayType","BoxRecommendedPlay","PredictedMember","Top2_pred","ThirdMember","RowPercentile","SingleRow","StreamTier"] if c in box.columns]
+    best = playable_elig[playable_elig["v54_StreamStraightRank"].le(best_depth)].copy()
+    best["PlaylistSection"] = "BEST_PRACTICE_V54_STRAIGHTS"
+    opt = playable_elig[(playable_elig["v54_StreamStraightRank"].gt(best_depth)) & (playable_elig["v54_StreamStraightRank"].le(optional_depth))].copy()
+    opt["PlaylistSection"] = "OPTIONAL_EXPANDED_V54_STRAIGHTS"
+    cols = [c for c in ["PlaylistSection","PlaylistRank","StreamKey","seed","BoxRecommendedPlay","StraightPermutation","v54_StreamStraightRank","v54_TotalPredictorScore","v54_BaseStraightScore","v54_MemberBoost","v54_DoublePositionBoost","v54_PositionMapBoost","v54_StackedRuleBoost","v54_StackedRuleHits","v54_MemberMatches","v54_DoublePositionMatches","v54_PositionMapMatches","v59_Eliminated","v59_EliminationReason","v54_StackedRuleMatches","StreamStraightRank","StraightConfidenceScore","RowPercentile","SingleRow"] if c in best.columns or c=="PlaylistSection"]
+    return box[box_cols], best[cols], opt[cols]
+
+def v54_zip_reports(box,best,opt,scored):
+    bio = io.BytesIO()
+    with zipfile.ZipFile(bio,"w",compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("v54_box_playlist.csv", box.to_csv(index=False))
+        z.writestr("v54_best_practice_structured_straights.csv", best.to_csv(index=False))
+        z.writestr("v54_optional_expanded_structured_straights.csv", opt.to_csv(index=False))
+        z.writestr("v54_all_structured_scored_straights.csv", scored.to_csv(index=False))
+    bio.seek(0)
+    return bio.getvalue()
+
+def v53_norm_perm_text(x):
+    digs = re.findall(r"\d", str(x))
+    if len(digs) < 4: return None
+    return "".join(digs[:4]).zfill(4)
+def v53_digits(seed): return [int(x) for x in str(seed).zfill(4)]
+def v53_digit_sum(seed): return sum(v53_digits(seed))
+def v53_root_sum(seed):
+    sm = v53_digit_sum(seed); return sm % 9 if sm % 9 != 0 else 9
+def v53_spread(seed):
+    d=v53_digits(seed); return max(d)-min(d)
+def v53_bucket(value, cuts):
+    prev=None
+    for c in cuts:
+        if value <= c: return f"<= {c}" if prev is None else f"{prev+1}-{c}"
+        prev=c
+    return f"> {cuts[-1]}"
+def v53_parity(seed): return "".join("E" if d%2==0 else "O" for d in v53_digits(seed))
+def v53_highlow(seed): return "".join("H" if d>=5 else "L" for d in v53_digits(seed))
+def v53_repeat_shape(seed):
+    vals=sorted(Counter(str(seed).zfill(4)).values(), reverse=True)
+    return "all_unique" if vals==[1,1,1,1] else "one_pair" if vals==[2,1,1] else "two_pair" if vals==[2,2] else "triple" if vals==[3,1] else "quad" if vals==[4] else "other"
+def v53_mirror_traits(seed):
+    ds=set(v53_digits(seed)); present=[]
+    for a,b in [(0,5),(1,6),(2,7),(3,8),(4,9)]:
+        if a in ds and b in ds: present.append(f"{a}{b}")
+    return {"mirror_count":str(len(present)),"has_mirror":str(int(bool(present))),"mirror_pairs":"|".join(present) if present else "none"}
+def v53_build_trait_tokens(seed):
+    s=str(seed).zfill(4); d=v53_digits(s); mt=v53_mirror_traits(s)
+    single={"seed_sum":str(v53_digit_sum(s)),"seed_sum_bucket":v53_bucket(v53_digit_sum(s),[6,10,14,18,22,26,30]),"seed_root":str(v53_root_sum(s)),"seed_spread":str(v53_spread(s)),"seed_spread_bucket":v53_bucket(v53_spread(s),[2,4,6,8]),"seed_parity":v53_parity(s),"seed_highlow":v53_highlow(s),"seed_repeat_shape":v53_repeat_shape(s),"seed_even_count":str(sum(1 for x in d if x%2==0)),"seed_high_count":str(sum(1 for x in d if x>=5)),"core_digit_count":str(sum(1 for ch in s if ch in "025")),"has0":str(int("0" in s)),"has2":str(int("2" in s)),"has5":str(int("5" in s)),"has9":str(int("9" in s)),"first_digit":s[0],"last_digit":s[-1],"first_pair":s[:2],"last_pair":s[2:],"mirror_count":mt["mirror_count"],"has_mirror":mt["has_mirror"],"mirror_pairs":mt["mirror_pairs"]}
+    for i,ch in enumerate(s):
+        single[f"S{i+1}"]=ch; single[f"S{i+1}_is_core"]=str(int(ch in "025"))
+    tokens=[f"{k}={v}" for k,v in single.items()]
+    for i in range(3):
+        p=s[i:i+2]; tokens += [f"adj_pair={p}", f"touching_unordered_pair={''.join(sorted(p))}"]
+    for i in range(4):
+        for j in range(i+1,4):
+            tokens += [f"ordered_pair_any={s[i]+s[j]}", f"unordered_pair_any={''.join(sorted(s[i]+s[j]))}", f"S{i+1}{j+1}={s[i]+s[j]}", f"S{i+1}{j+1}_unordered={''.join(sorted(s[i]+s[j]))}"]
+    for comb in [(0,1,2),(0,1,3),(0,2,3),(1,2,3)]:
+        tokens.append(f"unordered_triplet_any={''.join(sorted(''.join(s[i] for i in comb)))}")
+    return sorted(set(tokens))
+def v53_load_separator_rules(uploaded_rules, min_hits=2, min_conf=30.0, min_lift=1.5):
+    if uploaded_rules is None: return pd.DataFrame()
+    try: rules=pd.read_csv(uploaded_rules)
+    except Exception: return pd.DataFrame()
+    required={"TargetPermutation","TraitStack","Hits","TraitTotal","ConfidencePct","Lift","RuleScore"}
+    if required-set(rules.columns): return pd.DataFrame()
+    rules=rules.copy(); rules["TargetPermutation"]=rules["TargetPermutation"].map(v53_norm_perm_text)
+    for c in ["Hits","TraitTotal","ConfidencePct","Lift","RuleScore"]:
+        rules[c]=pd.to_numeric(rules[c], errors="coerce").fillna(0)
+    return rules[rules["TargetPermutation"].notna() & rules["Hits"].ge(min_hits) & rules["ConfidencePct"].ge(min_conf) & rules["Lift"].ge(min_lift)].sort_values(["RuleScore","Hits","Lift"], ascending=False).reset_index(drop=True)
+def v53_rule_match(tokens, stack):
+    parts=[p.strip() for p in str(stack).split("&&")]
+    return bool(parts) and all(p in tokens for p in parts)
+def v53_score_straights_with_rules(straight_df, rules_df, rule_weight=1.0, max_rule_boost=60.0):
+    if straight_df is None or straight_df.empty: return pd.DataFrame()
+    out=straight_df.copy(); base=pd.to_numeric(out.get("StraightConfidenceScore",0), errors="coerce").fillna(0)
+    if rules_df is None or rules_df.empty:
+        out["TraitRuleBoost"]=0.0; out["TraitRuleHits"]=0; out["TraitRuleTopMatches"]=""; out["TraitOptimizedStraightScore"]=base; out["TraitOptimizedStreamStraightRank"]=out.get("StreamStraightRank",999); return out
+    byperm={p:g for p,g in rules_df.groupby("TargetPermutation")}; cache={}; boosts=[]; counts=[]; matches=[]
+    for _,row in out.iterrows():
+        perm=v53_norm_perm_text(row.get("StraightPermutation","")); seed=str(row.get("seed","")).zfill(4)
+        if seed not in cache: cache[seed]=set(v53_build_trait_tokens(seed))
+        total=0.0; m=[]; grp=byperm.get(perm)
+        if grp is not None:
+            for _,rr in grp.head(350).iterrows():
+                if v53_rule_match(cache[seed], rr["TraitStack"]):
+                    raw=float(rr["RuleScore"])*0.18 + float(rr["Hits"])*0.65 + float(rr["Lift"])*0.20 + float(rr["ConfidencePct"])*0.035
+                    total += raw; m.append(f'{rr["TraitStack"]} [h={int(rr["Hits"])}, conf={rr["ConfidencePct"]:.1f}, lift={rr["Lift"]:.2f}]')
+        total=min(total*float(rule_weight), float(max_rule_boost)); boosts.append(round(total,4)); counts.append(len(m)); matches.append(" | ".join(m[:5]))
+    out["TraitRuleBoost"]=boosts; out["TraitRuleHits"]=counts; out["TraitRuleTopMatches"]=matches; out["TraitOptimizedStraightScore"]=(base+out["TraitRuleBoost"]).round(4)
+    out=out.sort_values(["PlaylistRank","TraitOptimizedStraightScore","StraightConfidenceScore","StreamStraightRank"], ascending=[True,False,False,True]).copy(); out["TraitOptimizedStreamStraightRank"]=out.groupby("PlaylistRank").cumcount()+1
+    return out
+def v53_playlist_sections(scored_df, stream_depth=15, best_depth=6, optional_depth=15):
+    if scored_df is None or scored_df.empty: return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    df=scored_df.copy(); df["PlaylistRankNum"]=pd.to_numeric(df.get("PlaylistRank",999), errors="coerce").fillna(999); elig=df[df["PlaylistRankNum"].le(stream_depth)].copy()
+    box=elig.sort_values("PlaylistRankNum").drop_duplicates("PlaylistRank").copy(); box["PlaylistSection"]="BOX_PLAYS"
+    box_cols=[c for c in ["PlaylistSection","PlaylistRank","StreamKey","State","Game","seed","BoxPlayType","BoxRecommendedPlay","PredictedMember","Top2_pred","ThirdMember","RowPercentile","SingleRow","StreamTier"] if c in box.columns]
+    best=elig[elig["TraitOptimizedStreamStraightRank"].le(best_depth)].copy(); best["PlaylistSection"]="BEST_PRACTICE_TRAIT_STRAIGHTS"
+    opt=elig[(elig["TraitOptimizedStreamStraightRank"].gt(best_depth)) & (elig["TraitOptimizedStreamStraightRank"].le(optional_depth))].copy(); opt["PlaylistSection"]="OPTIONAL_EXPANDED_TRAIT_STRAIGHTS"
+    s_cols=[c for c in ["PlaylistSection","PlaylistRank","StreamKey","seed","BoxRecommendedPlay","StraightPermutation","TraitOptimizedStreamStraightRank","TraitOptimizedStraightScore","TraitRuleBoost","TraitRuleHits","TraitRuleTopMatches","StraightConfidenceScore","StreamStraightRank","RowPercentile","SingleRow"] if c in best.columns or c=="PlaylistSection"]
+    return box[box_cols], best[s_cols], opt[s_cols]
+def v53_zip_reports(box,best,opt,scored,rules):
+    bio=io.BytesIO()
+    manifest=pd.DataFrame([{"Build":BUILD_MARKER,"Report":x} for x in ["v53_REPORT_MANIFEST.csv","v53_box_playlist.csv","v53_best_practice_trait_straights.csv","v53_optional_expanded_trait_straights.csv","v53_all_trait_scored_straights.csv","v53_loaded_separator_rules.csv"]])
+    with zipfile.ZipFile(bio,"w",compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("v53_REPORT_MANIFEST.csv", manifest.to_csv(index=False)); zf.writestr("v53_box_playlist.csv", box.to_csv(index=False)); zf.writestr("v53_best_practice_trait_straights.csv", best.to_csv(index=False)); zf.writestr("v53_optional_expanded_trait_straights.csv", opt.to_csv(index=False)); zf.writestr("v53_all_trait_scored_straights.csv", scored.to_csv(index=False)); zf.writestr("v53_loaded_separator_rules.csv", rules.to_csv(index=False))
+    bio.seek(0); return bio.getvalue()
+
+def v51_numeric_series(df: pd.DataFrame, col: str, default=0):
+    if df is None or df.empty or col not in df.columns:
+        return pd.Series([default] * (0 if df is None else len(df)))
+    return pd.to_numeric(df[col], errors="coerce")
+
+
+def v51_core_hit_rows(per_event: pd.DataFrame) -> pd.DataFrame:
+    if per_event is None or per_event.empty:
+        return pd.DataFrame()
+    df = per_event.copy()
+    if "IsCore025Hit" in df.columns:
+        df = df[pd.to_numeric(df["IsCore025Hit"], errors="coerce").fillna(0).astype(int).eq(1)].copy()
+    if "TrueStraightRank" not in df.columns:
+        return pd.DataFrame()
+    df["TrueStraightRankNum"] = pd.to_numeric(df["TrueStraightRank"], errors="coerce")
+    if "CandidateCount" in df.columns:
+        df["CandidateCountNum"] = pd.to_numeric(df["CandidateCount"], errors="coerce")
+    else:
+        df["CandidateCountNum"] = 24
+    df = df[df["TrueStraightRankNum"].notna()].copy()
+    df["TrueStraightRankNum"] = df["TrueStraightRankNum"].astype(int)
+    df["CandidateCountNum"] = df["CandidateCountNum"].fillna(24).replace(0, 24).astype(int)
+    df["StraightRankPercentile"] = (df["TrueStraightRankNum"] / df["CandidateCountNum"] * 100).round(2)
+    if "SingleRow" in df.columns:
+        df["SingleRowNum"] = pd.to_numeric(df["SingleRow"], errors="coerce")
+    else:
+        df["SingleRowNum"] = pd.NA
+    return df
+
+
+def build_v51_straight_rank_heatmap(per_event: pd.DataFrame) -> pd.DataFrame:
+    df = v51_core_hit_rows(per_event)
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "StraightListRow", "Wins", "WinSharePct", "CumulativeWins", "CumulativePct",
+            "RankOrder", "HeatTier", "SuggestedUse"
+        ])
+    total = len(df)
+    g = df.groupby("TrueStraightRankNum", dropna=False).size().reset_index(name="Wins")
+    g = g.rename(columns={"TrueStraightRankNum": "StraightListRow"}).sort_values(
+        ["Wins", "StraightListRow"], ascending=[False, True]
+    ).reset_index(drop=True)
+    g["WinSharePct"] = (g["Wins"] / total * 100).round(2)
+    g["RankOrder"] = range(1, len(g) + 1)
+
+    by_depth = df.groupby("TrueStraightRankNum").size().reindex(range(1, int(df["TrueStraightRankNum"].max()) + 1), fill_value=0).reset_index()
+    by_depth.columns = ["StraightListRow", "WinsAtDepth"]
+    by_depth["CumulativeWins"] = by_depth["WinsAtDepth"].cumsum()
+    by_depth["CumulativePct"] = (by_depth["CumulativeWins"] / total * 100).round(2)
+    g = g.merge(by_depth[["StraightListRow", "CumulativeWins", "CumulativePct"]], on="StraightListRow", how="left")
+
+    def tier(rank):
+        if rank <= 5:
+            return "🔥 HOTTEST"
+        if rank <= 10:
+            return "HOT"
+        if rank <= 15:
+            return "WATCH"
+        return "LOWER"
+    g["HeatTier"] = g["RankOrder"].apply(tier)
+    def suggested(row):
+        r = int(row["StraightListRow"])
+        if int(row["RankOrder"]) <= 6:
+            return "Conservative row-position target"
+        if r <= 10:
+            return "Included in Top10 depth"
+        if r <= 15:
+            return "Included in Top15 depth"
+        if r <= 20:
+            return "Deep coverage only"
+        return "Box-only unless testing deep"
+    g["SuggestedUse"] = g.apply(suggested, axis=1)
+    return g[["RankOrder", "StraightListRow", "Wins", "WinSharePct", "CumulativeWins", "CumulativePct", "HeatTier", "SuggestedUse"]]
+
+
+def build_v51_straight_percentile_heatmap(per_event: pd.DataFrame) -> pd.DataFrame:
+    df = v51_core_hit_rows(per_event)
+    if df.empty:
+        return pd.DataFrame(columns=["PercentileBand", "Wins", "WinSharePct"])
+    bins = [0, 10, 25, 50, 75, 100]
+    labels = ["0-10%", "10-25%", "25-50%", "50-75%", "75-100%"]
+    df["PercentileBand"] = pd.cut(df["StraightRankPercentile"], bins=bins, labels=labels, include_lowest=True, right=True)
+    out = df.groupby("PercentileBand", observed=False).size().reset_index(name="Wins")
+    out["WinSharePct"] = (out["Wins"] / len(df) * 100).round(2)
+    return out
+
+
+def build_v51_single_row_depth_table(per_event: pd.DataFrame) -> pd.DataFrame:
+    df = v51_core_hit_rows(per_event)
+    if df.empty or "SingleRowNum" not in df.columns:
+        return pd.DataFrame()
+    rows = []
+    for sr, sub in df.dropna(subset=["SingleRowNum"]).groupby("SingleRowNum"):
+        n = len(sub)
+        if n <= 0:
+            continue
+        ranks = sub["TrueStraightRankNum"]
+        rows.append({
+            "SingleRow": int(sr),
+            "Events": int(n),
+            "MedianTrueStraightRank": round(float(ranks.median()), 2),
+            "AvgTrueStraightRank": round(float(ranks.mean()), 2),
+            "Top5HitPct": round((ranks.le(5).sum() / n) * 100, 2),
+            "Top10HitPct": round((ranks.le(10).sum() / n) * 100, 2),
+            "Top15HitPct": round((ranks.le(15).sum() / n) * 100, 2),
+            "Top20HitPct": round((ranks.le(20).sum() / n) * 100, 2),
+            "BestCommonRows": ", ".join(
+                [str(int(x)) for x in ranks.value_counts().sort_values(ascending=False).head(5).index.tolist()]
+            ),
+        })
+    out = pd.DataFrame(rows).sort_values("SingleRow").reset_index(drop=True)
+    if not out.empty:
+        def rec(row):
+            if row["Events"] < 3:
+                return "LOW SAMPLE"
+            if row["Top10HitPct"] >= 70:
+                return "Top10"
+            if row["Top15HitPct"] >= 65:
+                return "Top15"
+            if row["Top20HitPct"] >= 65:
+                return "Top20"
+            return "Box-only / deep-test"
+        out["SuggestedDepth"] = out.apply(rec, axis=1)
+    return out
+
+
+def build_v51_strategy_grid(per_event: pd.DataFrame) -> pd.DataFrame:
+    df = v51_core_hit_rows(per_event)
+    if df.empty:
+        return pd.DataFrame()
+    if "SingleRowNum" not in df.columns:
+        df["SingleRowNum"] = pd.NA
+    stream_cuts = [5, 10, 15, 20, 25, 30, 40, 50, 60]
+    straight_depths = [3, 5, 8, 10, 12, 15, 20, 24]
+    rows = []
+    for sc in stream_cuts:
+        for depth in straight_depths:
+            sub = df[df["SingleRowNum"].fillna(999999).le(sc)].copy()
+            events = len(sub)
+            hits = int(sub["TrueStraightRankNum"].le(depth).sum()) if events else 0
+            plays = int(events * depth)
+            rows.append({
+                "StreamRowsPlayed": sc,
+                "StraightDepthPerStream": depth,
+                "MemberHitEventsInsideStreamRows": events,
+                "StraightHits": hits,
+                "StraightHitPctInsideSelectedRows": round(hits / events * 100, 2) if events else 0.0,
+                "ApproxStraightPlaysOnHitEvents": plays,
+                "PlaysPerStraightHit": round(plays / hits, 3) if hits else "",
+            })
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out["EfficiencyRank"] = out["PlaysPerStraightHit"].replace("", pd.NA)
+        out["EfficiencyRank"] = pd.to_numeric(out["EfficiencyRank"], errors="coerce").rank(method="dense", ascending=True)
+        out = out.sort_values(["StraightHitPctInsideSelectedRows", "PlaysPerStraightHit"], ascending=[False, True]).reset_index(drop=True)
+    return out
+
+
+def v51_make_heatmap_zip(rank_heatmap: pd.DataFrame, pct_heatmap: pd.DataFrame, single_row_depth: pd.DataFrame, strategy_grid: pd.DataFrame) -> bytes:
+    bio = io.BytesIO()
+    with zipfile.ZipFile(bio, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("straight_rank_row_heatmap__core025_northern_lights_v51.csv", (rank_heatmap if rank_heatmap is not None else pd.DataFrame()).to_csv(index=False))
+        zf.writestr("straight_rank_percentile_heatmap__core025_northern_lights_v51.csv", (pct_heatmap if pct_heatmap is not None else pd.DataFrame()).to_csv(index=False))
+        zf.writestr("straight_single_row_depth__core025_northern_lights_v51.csv", (single_row_depth if single_row_depth is not None else pd.DataFrame()).to_csv(index=False))
+        zf.writestr("straight_strategy_grid__core025_northern_lights_v51.csv", (strategy_grid if strategy_grid is not None else pd.DataFrame()).to_csv(index=False))
+    bio.seek(0)
+    return bio.getvalue()
+
+
+def make_straight_backtest_zip(summary: pd.DataFrame, per_event: pd.DataFrame, rankdist: pd.DataFrame) -> bytes:
+    """Create one downloadable ZIP so straight-backtest reports do not disappear between Streamlit reruns."""
+    bio = io.BytesIO()
+    with zipfile.ZipFile(bio, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("straight_backtest_summary__core025_northern_lights_v51.csv", (summary if summary is not None else pd.DataFrame()).to_csv(index=False))
+        zf.writestr("straight_backtest_per_event__core025_northern_lights_v51.csv", (per_event if per_event is not None else pd.DataFrame()).to_csv(index=False))
+        zf.writestr("straight_backtest_rank_distribution__core025_northern_lights_v51.csv", (rankdist if rankdist is not None else pd.DataFrame()).to_csv(index=False))
+        if per_event is not None and not per_event.empty:
+            misses = per_event[(per_event.get("IsCore025Hit", 0) == 1) & (per_event.get("RecommendedStraightHit", 0) == 0)].copy()
+            zf.writestr("straight_backtest_recommended_misses__core025_northern_lights_v50.csv", misses.to_csv(index=False))
+            top_hits = per_event[(per_event.get("IsCore025Hit", 0) == 1) & (per_event.get("RecommendedStraightHit", 0) == 1)].copy()
+            zf.writestr("straight_backtest_recommended_hits__core025_northern_lights_v50.csv", top_hits.to_csv(index=False))
+    bio.seek(0)
+    return bio.getvalue()
+
+
+
+with tab_v53:
+    st.header("v53 Trait-Rule Straight Optimizer")
+    st.caption("Full daily app mode: FULL HISTORY, TRUTH, 24h, and library inputs are retained. Run Straight Plays first, then v53 re-ranks the generated straight list using stacked separator rules.")
+    v53_rules = v53_load_separator_rules(v53_rules_file, V55_MIN_RULE_HITS, float(V55_MIN_RULE_CONF), float(V55_MIN_RULE_LIFT))
+    if v53_rules_file is None:
+        st.warning("Upload the v53 stacked separator rules CSV to activate trait-rule scoring.")
+    elif v53_rules.empty:
+        st.error("v53 rules file loaded, but no rules passed the current thresholds.")
+    else:
+        st.success(f"Loaded {len(v53_rules):,} usable v53 separator rules.")
+    if st.button("Run v53 Daily Optimized Playlist", type="primary", use_container_width=True, key="run_v53_daily_optimizer"):
+        straight_df_base = st.session_state.get("straight_ranked_df", pd.DataFrame())
+        if straight_df_base is None or straight_df_base.empty:
+            st.warning("Run the Straight Plays tab first in this same session. v53 uses that generated straight list and re-ranks it.")
+        else:
+            scored_v53 = v53_score_straights_with_rules(straight_df_base, v53_rules if v53_enable_trait_optimizer else pd.DataFrame(), rule_weight=v53_rule_weight)
+            box_v53, best_v53, opt_v53 = v53_playlist_sections(scored_v53, v53_stream_depth, v53_best_depth, max(v53_optional_depth, v53_best_depth))
+            st.session_state["v53_box_playlist"]=box_v53; st.session_state["v53_best_straights"]=best_v53; st.session_state["v53_optional_straights"]=opt_v53; st.session_state["v53_scored_straights"]=scored_v53; st.session_state["v53_rules_loaded"]=v53_rules
+    box_v53=st.session_state.get("v53_box_playlist", pd.DataFrame()); best_v53=st.session_state.get("v53_best_straights", pd.DataFrame()); opt_v53=st.session_state.get("v53_optional_straights", pd.DataFrame()); scored_v53=st.session_state.get("v53_scored_straights", pd.DataFrame()); rules_loaded_v53=st.session_state.get("v53_rules_loaded", v53_rules if "v53_rules" in locals() else pd.DataFrame())
+    if box_v53 is not None and not box_v53.empty:
+        st.markdown("## SECTION 1 — BOX PLAYS"); st.dataframe(box_v53, use_container_width=True, hide_index=True)
+        st.markdown("---"); st.markdown("## SECTION 2 — BEST PRACTICE TRAIT-OPTIMIZED STRAIGHTS"); st.dataframe(best_v53, use_container_width=True, hide_index=True)
+        st.markdown("---"); st.markdown("## SECTION 3 — OPTIONAL / AGGRESSIVE EXPANDED STRAIGHTS"); st.dataframe(opt_v53, use_container_width=True, hide_index=True)
+        with st.expander("Full v53 trait-scored straight list", expanded=False):
+            st.dataframe(scored_v53, use_container_width=True, hide_index=True)
+        st.download_button("Download v53 unified playlist ZIP", v53_zip_reports(box_v53,best_v53,opt_v53,scored_v53,rules_loaded_v53), "core025_v53_1_trait_optimized_daily_playlist.zip", "application/zip", use_container_width=True, key="download_v53_1_playlist_zip")
+    else:
+        st.info("Run Straight Plays first, then run v53 Daily Optimized Playlist.")
+
+
+
+with tab_v54:
+    st.header("v55 Simplified Final Playlist")
+    st.caption("Simple workflow: Run Daily Prediction → Run Straight Plays → click this button. Uses fixed defaults: Top 12 streams, 3 best straights, optional depth 6.")
+    st.info("V55 defaults: Top 12 ranked streams are the play set. The full stream list stays visible for review, but the final play list is filtered to Top 12 streams and Top 3 straights by default.")
+    if st.button("Run v55 Final Playlist", type="primary", use_container_width=True, key="run_v54_integrated"):
+        straight_df_base = st.session_state.get("straight_ranked_df", pd.DataFrame())
+        if straight_df_base is None or straight_df_base.empty:
+            st.warning("Run the Straight Plays tab first in this same session. v54 uses the generated straight_ranked_df.")
+        else:
+            rules_v54 = v53_load_separator_rules(v53_rules_file, V55_MIN_RULE_HITS, float(V55_MIN_RULE_CONF), float(V55_MIN_RULE_LIFT)) if "v53_load_separator_rules" in globals() else pd.DataFrame()
+            mined_reports_v55 = v55_load_mined_reports_zip(v55_mined_reports_zip)
+            seed_trait_member_df = v54_normalize_seed_trait_to_member(mined_reports_v55["seed_trait_member"])
+            seed_position_member_df = v54_normalize_seed_trait_to_member(mined_reports_v55["seed_position_member"])
+            double_position_df = v54_normalize_numeric(mined_reports_v55["double_position"])
+            seed_trait_double_df = v54_normalize_numeric(mined_reports_v55["seed_trait_double"])
+            position_map_df = v54_normalize_numeric(mined_reports_v55["position_map"])
+            same_position_df = v54_normalize_numeric(mined_reports_v55["same_position"])
+            straight_df_filtered_v59 = v59_apply_guarded_elimination(straight_df_base, rules_v54, seed_trait_member_df, seed_position_member_df, double_position_df, seed_trait_double_df)
+            scored_v54 = v54_predict_structured(straight_df_filtered_v59, rules_v54, seed_trait_member_df, seed_position_member_df, double_position_df, seed_trait_double_df, position_map_df, same_position_df, V55_MEMBER_WEIGHT, V55_DOUBLE_WEIGHT, V55_POSITION_WEIGHT, V55_STACK_WEIGHT, V55_MAX_STACK_BOOST)
+            box_v54, best_v54, opt_v54 = v54_sections(scored_v54, V55_PRODUCTION_STREAM_DEPTH, V55_BEST_STRAIGHTS_PER_STREAM, V55_OPTIONAL_STRAIGHT_DEPTH)
+            st.session_state["v54_box_playlist"] = box_v54
+            st.session_state["v54_best_straights"] = best_v54
+            st.session_state["v54_optional_straights"] = opt_v54
+            st.session_state["v54_scored_straights"] = scored_v54
+
+    box_v54 = st.session_state.get("v54_box_playlist", pd.DataFrame())
+    best_v54 = st.session_state.get("v54_best_straights", pd.DataFrame())
+    opt_v54 = st.session_state.get("v54_optional_straights", pd.DataFrame())
+    scored_v54 = st.session_state.get("v54_scored_straights", pd.DataFrame())
+
+    if box_v54 is not None and not box_v54.empty:
+        st.markdown("## SECTION 1 — BOX PLAYS")
+        st.dataframe(box_v54, use_container_width=True, hide_index=True)
+        st.markdown("---")
+        st.markdown("## SECTION 2 — BEST PRACTICE STRUCTURED STRAIGHTS")
+        st.dataframe(best_v54, use_container_width=True, hide_index=True)
+        st.markdown("---")
+        st.markdown("## SECTION 3 — OPTIONAL / AGGRESSIVE EXPANDED STRAIGHTS")
+        st.dataframe(opt_v54, use_container_width=True, hide_index=True)
+        with st.expander("Full v54 structured scored straight list", expanded=False):
+            st.dataframe(scored_v54, use_container_width=True, hide_index=True)
+        st.download_button("Download v55 final playlist ZIP", v54_zip_reports(box_v54,best_v54,opt_v54,scored_v54), "core025_v55_simplified_final_playlist_reports.zip", "application/zip", use_container_width=True, key="dl_v54_integrated_zip")
+    else:
+        st.info("Run Straight Plays first, then click Run v55 Final Playlist.")
+
+
+with tab_straight_backtest:
+    st.subheader("Straight Walk-forward Backtest — v50")
+    st.caption("Tests the straight ranking layer against the actual straight result from lab events. This does not alter the v46 box layer.")
+
+    if st.session_state["lab_results"] is None:
+        st.warning("Run Walk-forward Lab first. The straight backtest uses the current lab rows and their v46/v47 box recommendations.")
+    else:
+        depth = st.slider("Backtest recommended straight depth", 1, 10, 2, step=1, key="straight_backtest_depth")
+        recommended_only_bt = st.checkbox("Backtest recommended streams only", value=False, key="straight_backtest_recommended_only")
+        backtest_scope = st.selectbox("Backtest scope", ["Member-Only Events (diagnostic)", "All Events (real-world cost)"], index=0, key="straight_backtest_scope")
+        max_events_to_process = st.number_input("Max events to process (0 = all)", min_value=0, max_value=250000, value=0, step=25, key="straight_bt_max_events")
+        batch_size_bt = st.slider("Backtest batch/progress interval", 5, 100, 25, step=5, key="straight_bt_batch_size")
+        if st.button("Run Straight Backtest", type="primary", use_container_width=True, key="straight_backtest_run"):
+            status = st.status("Running straight backtest...", expanded=True)
+            progress_bar = st.progress(0)
+            if backtest_scope.startswith("All Events"):
+                all_event_rows = build_all_draw_event_rows(hist_raw)
+                all_event_rows = all_event_rows[all_event_rows["StreamKey"].isin(kept_streams)].copy()
+                row_model_df = build_row_play_model(
+                    st.session_state.get("row_single_perf"),
+                    row_model_min_hits,
+                    row_top3_rate_threshold,
+                    row_top2_rate_threshold,
+                    row_top1_rate_threshold,
+                    row_low_top2_rate_threshold,
+                )
+                scoped_results = score_event_rows_for_current_model(
+                    all_event_rows, rules, stream_diag, trait_weight, min_margin, enable_margin_swap,
+                    top2_zone_ratio, top2_zone_margin, top2_risk_threshold,
+                    enable_top3_rescue, top3_rescue_min_score, w_model, w_row, w_density, w_outlier,
+                    row_model_df, enable_row_playtype_model, play_policy,
+                )
+            else:
+                scoped_results = st.session_state["lab_results"]
+            per_event, summary, rankdist = run_v50_straight_backtest(
+                scoped_results,
+                max_depth=depth,
+                recommended_only=recommended_only_bt,
+                scope_label=backtest_scope,
+                recent_window=int(straight_recent_window),
+                max_events=int(max_events_to_process) if int(max_events_to_process) > 0 else None,
+                batch_size=int(batch_size_bt),
+                progress_bar=progress_bar,
+                status_box=status,
+            )
+            st.session_state["straight_backtest_results"] = per_event
+            st.session_state["straight_backtest_summary"] = summary
+            st.session_state["straight_backtest_rankdist"] = rankdist
+            status.update(label="Straight backtest complete", state="complete", expanded=False)
+
+    if st.session_state["straight_backtest_summary"] is not None:
+        summary = st.session_state["straight_backtest_summary"]
+        per_event = st.session_state["straight_backtest_results"]
+        rankdist = st.session_state["straight_backtest_rankdist"]
+
+        st.markdown("### Straight Backtest Summary")
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+
+        if not summary.empty:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Top1 straight hits", int(summary.iloc[0].get("top1_hits", 0)))
+            c2.metric("Top2-depth straight hits", int(summary.iloc[0].get("top2_hits", 0)))
+            c3.metric("Candidate pool coverage", f"{float(summary.iloc[0].get('candidate_pool_pct', 0)):.2f}%")
+            c4.metric("Plays per straight hit", summary.iloc[0].get("plays_per_straight_hit", ""))
+
+        st.markdown("### Hit Rank Distribution")
+        st.dataframe(rankdist, use_container_width=True, hide_index=True)
+
+        st.markdown("### v51 Straight Rank-Row Heat Map")
+        rank_heatmap_v51 = build_v51_straight_rank_heatmap(per_event)
+        pct_heatmap_v51 = build_v51_straight_percentile_heatmap(per_event)
+        single_row_depth_v51 = build_v51_single_row_depth_table(per_event)
+        strategy_grid_v51 = build_v51_strategy_grid(per_event)
+
+        if rank_heatmap_v51.empty:
+            st.warning("No true-straight rank rows were available for the v51 heat map. Run member-only straight backtest first.")
+        else:
+            hottest = rank_heatmap_v51.head(10).copy()
+            hot_rows = ", ".join([str(int(x)) for x in hottest["StraightListRow"].head(6).tolist()])
+            st.markdown(f"**Hottest straight-list rows:** **{hot_rows}**")
+            st.caption("RankOrder sorts the straight-list rows by historical win count. This is the ordered list you asked for; do not rely on bolding alone.")
+            st.dataframe(rank_heatmap_v51, use_container_width=True, hide_index=True)
+
+        st.markdown("### v51 Straight Percentile Heat Map")
+        st.caption("Shows where the winning straight lands by percentile inside each stream's ranked straight list.")
+        st.dataframe(pct_heatmap_v51, use_container_width=True, hide_index=True)
+
+        st.markdown("### v51 Stream-Row vs Straight-Depth Strategy Grid")
+        st.caption("Use this to compare fewer streams + deeper straight coverage vs more streams + shallower coverage. Plays are estimated on member-hit events for ranking diagnostics, not full ROI.")
+        if not strategy_grid_v51.empty:
+            min_hit_pct = st.slider("Strategy grid: minimum straight hit % inside selected rows", 0, 100, 50, step=5, key="v51_strategy_min_hit_pct")
+            filtered_strategy_v51 = strategy_grid_v51[strategy_grid_v51["StraightHitPctInsideSelectedRows"].ge(float(min_hit_pct))].copy()
+            st.dataframe(filtered_strategy_v51, use_container_width=True, hide_index=True)
+        else:
+            st.warning("No strategy grid rows available.")
+
+        with st.expander("SingleRow depth table (stream-rank row diagnostics)", expanded=False):
+            st.dataframe(single_row_depth_v51, use_container_width=True, hide_index=True)
+
+        st.download_button(
+            "Download v51 Heat Map + Strategy ZIP",
+            v51_make_heatmap_zip(rank_heatmap_v51, pct_heatmap_v51, single_row_depth_v51, strategy_grid_v51),
+            "straight_heatmap_strategy__core025_northern_lights_v51.zip",
+            "application/zip",
+            use_container_width=True,
+            key="dl_v51_heatmap_strategy_zip",
+        )
+
+        st.markdown("### Per-event Straight Backtest")
+        front_cols = [
+            "StreamKey", "Date", "seed", "Result", "TrueMember", "TrueStraight",
+            "PredictedMember", "Top2_pred", "ThirdMember", "PlayType", "RecommendedPlay",
+            "CandidateCount", "EligibleMembers", "CorrectMemberEligible", "TrueStraightInCandidates", "TrueStraightRank", "TrueStraightRecommended", "StraightMissReason", "HitRank", "Top1Straight", "Top2Straight", "Top3Straight", "RecommendedStraightAudit", "Top10StraightAudit",
+            "Top1StraightHit", "Top2StraightHit", "Top3StraightHit", "Top5StraightHit", "Top10StraightHit",
+            "RecommendedStraightDepth", "RecommendedStraightHit", "RecommendedStraightPlays",
+        ]
+        view = per_event[[c for c in front_cols if c in per_event.columns] + [c for c in per_event.columns if c not in front_cols]]
+        if view.empty:
+            st.warning("Straight backtest produced no rows. Check Backtest Scope, Recommended-only filter, and whether lab results exist.")
+        else:
+            audit_filter = st.selectbox("Quick audit view", ["All rows", "Core025 hits only", "Recommended misses only", "Oregon 10pm only"], index=0, key="straight_bt_audit_filter")
+            shown = view.copy()
+            if audit_filter == "Core025 hits only" and "IsCore025Hit" in shown.columns:
+                shown = shown[shown["IsCore025Hit"].astype(str).isin(["1", "1.0", "True", "true"])]
+            elif audit_filter == "Recommended misses only" and "StraightMissReason" in shown.columns:
+                shown = shown[shown["StraightMissReason"].astype(str).ne("HIT_WITHIN_RECOMMENDED_DEPTH")]
+                if "IsCore025Hit" in shown.columns:
+                    shown = shown[shown["IsCore025Hit"].astype(str).isin(["1", "1.0", "True", "true"])]
+            elif audit_filter == "Oregon 10pm only" and "StreamKey" in shown.columns:
+                shown = shown[shown["StreamKey"].astype(str).str.contains("Oregon", case=False, na=False) & shown["StreamKey"].astype(str).str.contains("10pm", case=False, na=False)]
+            st.dataframe(shown, use_container_width=True, hide_index=True)
+
+        st.markdown("### Downloads")
+        st.download_button(
+            "Download ALL Straight Backtest Reports ZIP",
+            make_straight_backtest_zip(summary, per_event, rankdist),
+            "straight_backtest_REPORTS__core025_northern_lights_v51.zip",
+            "application/zip",
+            use_container_width=True,
+            key="dl_v50_straight_backtest_zip",
+        )
+
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            st.download_button(
+                "Download Straight Backtest Summary CSV",
+                summary.to_csv(index=False).encode("utf-8"),
+                "straight_backtest_summary__core025_northern_lights_v51.csv",
+                "text/csv",
+                use_container_width=True,
+                on_click="ignore",
+                key="dl_v50_straight_backtest_summary_csv",
+            )
+        with d2:
+            st.download_button(
+                "Download Straight Backtest Per Event CSV",
+                per_event.to_csv(index=False).encode("utf-8"),
+                "straight_backtest_per_event__core025_northern_lights_v51.csv",
+                "text/csv",
+                use_container_width=True,
+                on_click="ignore",
+                key="dl_v50_straight_backtest_per_event_csv",
+            )
+        with d3:
+            st.download_button(
+                "Download Straight Hit Rank Distribution CSV",
+                rankdist.to_csv(index=False).encode("utf-8"),
+                "straight_backtest_rank_distribution__core025_northern_lights_v51.csv",
+                "text/csv",
+                use_container_width=True,
+                on_click="ignore",
+                key="dl_v50_straight_backtest_rankdist_csv",
+            )
+
+
+with tab_help:
+    st.markdown("""
+### What this build keeps from Northern Lights
+- Full history input
+- Optional last 24h input
+- Live daily prediction tab
+- Walk-forward lab tab
+- Stream reduction / low-density pruning
+- Percentile list
+- Downloadable outputs
+
+### v44 decision-layer correction
+- Keeps v34 scoring, promoted-library feature matching, full-truth mining, and stream reduction.
+- Removes destructive third-choice GATED_TOP3 hijack.
+- Top1 is the highest score and Top2 is the second-highest score.
+- Optional cautious Top1/Top2 margin swap is OFF by default for clean testing.\n- Adds Top2-zone-gated deep risk scoring.\n- Deep risk traits are evaluated only after the first gate confirms the row is in a Top2 zone.
+
+### What this build adds from the 75% v22/v31 path
+- Promoted separator library scoring
+- FULL TRUTH intelligence layer
+- On-run truth-mined separators
+- `winner_rate * trait_weight` scoring
+- Strong `GATED_TOP3` logic
+- 025-only member prediction: `0025`, `0225`, `0255`
+
+### v44 stream / row scoring + rare Top3 rescue additions
+- Adds PlayType and RecommendedPlay display logic.
+- Full capture display can bold Top1+Top2, while risk-gate mode bolds Top2 only when TOP2_REQUIRED.
+- Adds row-by-row percentile scoring: SingleRow, RowPercentile, RowBucket10, StreamTier.
+- Adds a Stream / Row Tests tab for Top-N, percentile bands, tiers, and single-row historical performance.
+- Adds Rare Top3 Rescue for miss/outlier rows before any Top2 waste trimming.
+- Adds UniversalFamilyScore, scaled for future cross-family app comparison.
+- Adds explicit Stream / Row Test download buttons for CSV and TXT exports.
+- v44 corrects row play-type logic: low-sample rows default to TOP1_TOP2 instead of automatic Top3.
+- v44 adds Top2 cost control: rows with Top2 rate below the selected threshold become TOP1_ONLY.
+- Keeps unique download-button keys and Row Play Model export.
+
+### v46 final optimized row play-type corrections
+- Low-sample rows default to TOP1_TOP2, not automatic Top3.
+- Top3 default threshold is 0.25 with minimum 4 historical hits.
+- Top2 cost control default threshold is 0.35 in the UI, representing the optimized 0.33–0.35 band.
+- All download filenames and build labels are v46.
+
+### v47 straight play generator additions
+- Preserves v46 box recommendations exactly.
+- Adds strict straight eligibility so Top2/Top3 box insurance does not automatically become straight action.
+- Generates 12 unique permutations per Core025 member.
+- Scores each permutation using actual historical position frequency, ordered-pair frequency, seed-transition behavior, stream ordering bias, recent stream/member ordering, and member confidence.
+- Exports ranked straights, summary, and recommended-only straights with v47 self-identifying filenames.
+
+### Required files
+For daily prediction:
+1. Full history
+2. Promoted separator library
+3. FULL TRUTH file recommended for intelligence layer
+4. Last 24h optional
+
+For lab:
+Same files, then run Walk-forward Lab.
+""")
