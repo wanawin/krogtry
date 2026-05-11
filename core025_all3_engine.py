@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# BUILD: core025_all3_member_straight_rank_generator__2026-05-10_v1
+# BUILD: core025_all3_member_straight_rank_generator_engine__2026-05-10_v3
 """
 Standalone Core025 all-3-member straight rank generator.
 
@@ -38,7 +38,7 @@ from typing import Dict, List, Tuple
 
 import pandas as pd
 
-BUILD_MARKER = "BUILD: core025_all3_member_straight_rank_generator__2026-05-10_v1"
+BUILD_MARKER = "BUILD: core025_all3_member_straight_rank_generator_engine__2026-05-10_v3"
 MEMBERS = ["0025", "0225", "0255"]
 
 
@@ -201,24 +201,108 @@ def normalize_history(df_raw: pd.DataFrame) -> pd.DataFrame:
     return out.sort_values(["StreamKey", "Date"]).reset_index(drop=True)
 
 
-def normalize_lab_events(df_raw: pd.DataFrame) -> pd.DataFrame:
+def normalize_lab_events(df_raw: pd.DataFrame, hist: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """
+    Accepts either:
+    - original lab_per_event with seed + Result
+    - v78 straight per-event detail with TrueStraight and no seed
+
+    If seed is missing, derive it from full history:
+    prior draw in same StreamKey before event Date.
+    """
     df = df_raw.copy()
     df.columns = [str(c).strip() for c in df.columns]
-    for c in ["StreamKey", "Date", "seed", "Result"]:
-        if c not in df.columns:
-            raise ValueError(f"Lab per-event file missing required column: {c}")
+
+    if "StreamKey" not in df.columns:
+        raise ValueError("Lab per-event file missing required column: StreamKey")
+    if "Date" not in df.columns:
+        raise ValueError("Lab per-event file missing required column: Date")
+
+    # v78 straight detail has multiple modes per EventIndex.
+    # Keep one row per event, preferring ALWAYS_TOP1__NONE if present.
+    if "EventIndex" in df.columns and "Mode" in df.columns:
+        pref = df["Mode"].astype(str).eq("ALWAYS_TOP1__NONE").astype(int)
+        df = df.assign(_pref_mode=pref).sort_values(["EventIndex", "_pref_mode"], ascending=[True, False])
+        df = df.drop_duplicates("EventIndex", keep="first").drop(columns=["_pref_mode"])
+
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df["seed"] = df["seed"].astype(str).apply(lambda x: extract_pick4_digits(x) or re.sub(r"\D", "", str(x)).zfill(4)[-4:])
+
+    # Result / TrueStraight compatibility.
+    if "Result" not in df.columns:
+        if "TrueStraight" in df.columns:
+            df["Result"] = df["TrueStraight"]
+        else:
+            raise ValueError("Lab per-event file missing Result/TrueStraight column")
     df["Result"] = df["Result"].astype(str).apply(extract_pick4_digits)
+
+    # Seed compatibility. If missing, derive from history.
+    if "seed" not in df.columns:
+        df["seed"] = ""
+    df["seed"] = df["seed"].astype(str).apply(lambda x: extract_pick4_digits(x) if extract_pick4_digits(x) else "")
+
+    if (df["seed"].astype(str).str.len() != 4).any():
+        if hist is None or hist.empty:
+            raise ValueError("Lab file is missing seed, and full history was not available to derive seed.")
+        h = hist.copy()
+        h["Date"] = pd.to_datetime(h["Date"], errors="coerce")
+        h = h.sort_values(["StreamKey", "Date"]).reset_index(drop=True)
+
+        prior_map = {}
+        for stream, g in h.groupby("StreamKey"):
+            g = g.sort_values("Date").reset_index(drop=True)
+            for i in range(1, len(g)):
+                key = (str(stream), pd.Timestamp(g.loc[i, "Date"]).normalize())
+                prior_map[key] = str(g.loc[i-1, "Result"]).zfill(4)
+
+        derived = []
+        for _, r in df.iterrows():
+            current = str(r.get("seed", ""))
+            if len(current) == 4:
+                derived.append(current)
+                continue
+            key = (str(r.get("StreamKey", "")), pd.Timestamp(r.get("Date")).normalize())
+            derived.append(prior_map.get(key, ""))
+        df["seed"] = derived
+
+    missing_seed = df["seed"].astype(str).str.len().ne(4).sum()
+    if missing_seed:
+        raise ValueError(f"Could not derive seed for {missing_seed} event rows. Check StreamKey/Date match against full history.")
+
     if "TrueMember" not in df.columns:
         df["TrueMember"] = df["Result"].apply(result_to_core025_member)
     else:
         df["TrueMember"] = df["TrueMember"].apply(normalize_member)
+
     for c in ["PredictedMember", "Top2_pred", "ThirdMember"]:
         if c in df.columns:
             df[c] = df[c].apply(normalize_member)
         else:
             df[c] = ""
+
+    # Fill optional columns expected downstream.
+    optional_defaults = {
+        "SingleRow": "",
+        "StreamRank": "",
+        "RowPercentile": "",
+        "StreamTier": "",
+        "PlayType": "",
+        "Top2Decision": "",
+        "Top2RiskScore": "",
+        "Top2ToTop1Ratio": "",
+        "Margin": "",
+        "RowVolatilityRate": "",
+        "RowTop1Rate": "",
+        "RowTop2Rate": "",
+        "RowTop3Rate": "",
+        "RowPlayType": "",
+        "RowPlayTypeReason": "",
+        "Top3Rescue": "",
+        "Top3RescueReasons": "",
+    }
+    for c, val in optional_defaults.items():
+        if c not in df.columns:
+            df[c] = val
+
     return enrich_seed_features(df, "seed").reset_index(drop=True)
 
 
