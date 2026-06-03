@@ -3,9 +3,9 @@ import streamlit as st
 import datetime as dt
 import numpy as np
 
-st.set_page_config(page_title="Core025 Northern Lights v144", layout="wide")
+st.set_page_config(page_title="Core025 Northern Lights v145", layout="wide")
 
-BUILD_MARKER = "BUILD: core025_northern_lights__2026-06-03_v144_HYBRID_STABLE"
+BUILD_MARKER = "BUILD: core025_northern_lights__2026-06-03_v145_HYBRID_STABLE"
 
 st.title("Core025 Northern Lights — 025 Live + Lab")
 st.caption(BUILD_MARKER)
@@ -45,7 +45,7 @@ def parse_date_column(df):
     df[date_col] = pd.to_datetime(df[date_col], errors='coerce').dt.date
     return df
 
-# ====================== STABLE HYBRID RANKING v144 ======================
+# ====================== STABLE HYBRID RANKING v145 ======================
 def build_true_hybrid_rank_actual_cost(playlist):
     if playlist is None or playlist.empty:
         return pd.DataFrame()
@@ -57,7 +57,7 @@ def build_true_hybrid_rank_actual_cost(playlist):
             return pd.to_numeric(out[col], errors='coerce').fillna(default)
         return pd.Series(default, index=out.index)
     
-    # Dynamic Score with safe fallbacks
+    # Dynamic Score
     top1 = safe_num('Top1_score')
     if top1.std() == 0:
         top1 = safe_num('ModelConfidenceScore')
@@ -93,15 +93,15 @@ def build_true_hybrid_rank_actual_cost(playlist):
     out['HybridScore'] = 0.50 * out['DynamicRank'] + 0.35 * out['SingleRowHistoricalRank'] + 0.15 * out['DuePressureRank']
     out['HybridFinalRank'] = safe_rank(out['HybridScore'], ascending=True).astype(int)
     
-    # Robust Actual Play Members extraction
+    # ROBUST Actual Members To Play
     play_candidates = ['ActualBoxPlay', 'ActualBoxPlayDisplay', 'BoxPlayInstruction', 
                        'RecommendedPlay', 'PredictedMember', 'Top1', 'ActualMembersToPlay']
     play_col = next((c for c in play_candidates if c in out.columns), None)
     
     if play_col:
-        out['ActualMembersToPlay'] = out[play_col].astype(str)
+        out['ActualMembersToPlay'] = out[play_col].fillna('0025').astype(str)
     else:
-        out['ActualMembersToPlay'] = out.get('PredictedMember', '0025').astype(str)
+        out['ActualMembersToPlay'] = pd.Series('0025', index=out.index)
     
     out['ActualPlayCount'] = out['ActualMembersToPlay'].str.count(r'0025|0225|0255').clip(lower=1).astype(int)
     out['Action'] = out['ActualPlayCount'].map({1:'TOP1', 2:'TOP2', 3:'TOP3', 0:'NO PLAY'})
@@ -113,7 +113,7 @@ def build_true_hybrid_rank_actual_cost(playlist):
     out['RunningPlayTotal'] = out['ActualPlayCount'].cumsum()
     out['RunningCostDisplay'] = (out['RunningPlayTotal'] * 0.25).map(lambda x: f"${x:.2f}")
     
-    # Column order
+    # Column order (important fields first)
     front = ['PlayOrder', 'HybridFinalRank', 'HybridScore', 'StreamKey', 'State', 'Game',
              'Action', 'ActualMembersToPlay', 'ActualPlayCount', 'RowCostDisplay',
              'RunningPlayTotal', 'RunningCostDisplay', 'OldStreamRank', 'DynamicRank',
@@ -129,7 +129,7 @@ with tab2:
     st.subheader("📅 Daily Predictor — Ranked Playlist for Tomorrow")
     static_model = st.file_uploader("Static Trained Model", type=["csv","txt","tsv"], key="daily_static")
     separator_library = st.file_uploader("Separator Traits Library", type=["csv","txt","tsv"], key="daily_separators")
-    mandatory_bridge = st.file_uploader("MANDATORY Bridge History", type=["csv","txt","tsv"], key="daily_bridge")
+    mandatory_bridge = st.file_uploader("MANDATORY Bridge History (deep history)", type=["csv","txt","tsv"], key="daily_bridge")
     last_24h = st.file_uploader("Optional Last 24-Hour Winner File", type=["csv","txt","tsv"], key="daily_24h")
 
     if static_model and separator_library and mandatory_bridge:
@@ -169,4 +169,4 @@ with tab2:
     else:
         st.warning("Upload Static Model + Separator Library + Mandatory Bridge History")
 
-st.caption("v144: Hybrid ranking stabilized with robust fallbacks. Total cost and ranking diversity fixed.")
+st.caption("v145: Hybrid ranking stabilized with safe fallbacks. ActualMembersToPlay error fixed.")
