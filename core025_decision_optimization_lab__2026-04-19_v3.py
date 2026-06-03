@@ -3,19 +3,12 @@ import streamlit as st
 import datetime as dt
 import numpy as np
 
-st.set_page_config(page_title="Core025 Northern Lights v145", layout="wide")
+st.set_page_config(page_title="Core025 Northern Lights v146", layout="wide")
 
-BUILD_MARKER = "BUILD: core025_northern_lights__2026-06-03_v145_HYBRID_STABLE"
+BUILD_MARKER = "BUILD: core025_northern_lights__2026-06-03_v146_HYBRID_REALISTIC"
 
 st.title("Core025 Northern Lights — 025 Live + Lab")
 st.caption(BUILD_MARKER)
-
-def normalize_win(x):
-    if pd.isna(x) or str(x).strip() == "":
-        return ""
-    s = str(x).strip().replace(" ", "")
-    mapping = {"25":"0025", "225":"0225", "255":"0255", "0025":"0025", "0225":"0225", "0255":"0255"}
-    return mapping.get(s, s.zfill(4) if s.isdigit() else s)
 
 def load_file(uploaded_file):
     if uploaded_file is None:
@@ -45,7 +38,7 @@ def parse_date_column(df):
     df[date_col] = pd.to_datetime(df[date_col], errors='coerce').dt.date
     return df
 
-# ====================== STABLE HYBRID RANKING v145 ======================
+# ====================== IMPROVED HYBRID v146 ======================
 def build_true_hybrid_rank_actual_cost(playlist):
     if playlist is None or playlist.empty:
         return pd.DataFrame()
@@ -57,16 +50,21 @@ def build_true_hybrid_rank_actual_cost(playlist):
             return pd.to_numeric(out[col], errors='coerce').fillna(default)
         return pd.Series(default, index=out.index)
     
-    # Dynamic Score
+    # Dynamic components with heavy fallbacks
     top1 = safe_num('Top1_score')
     if top1.std() == 0:
         top1 = safe_num('ModelConfidenceScore')
+    if top1.std() == 0:
+        top1 = safe_num('StreamRank', 1)  # fallback to rank itself
+    
     gap = safe_num('gap')
     if gap.std() == 0:
         gap = safe_num('Margin')
+    
     ratio = safe_num('ratio')
     if ratio.std() == 0:
         ratio = safe_num('Top2ToTop1Ratio')
+    
     top23 = safe_num('Top2_score') + safe_num('Top3_score')
     
     def safe_rank(s, ascending=True):
@@ -82,29 +80,31 @@ def build_true_hybrid_rank_actual_cost(playlist):
     )
     out['DynamicRank'] = safe_rank(out['DynamicScore'], ascending=False).astype(int)
     
+    # SingleRow fallback chain
     sr = safe_num('SingleRow')
     if sr.std() == 0:
         sr = safe_num('RowPercentile')
     if sr.std() == 0:
         sr = safe_num('StreamRank')
+    if sr.std() == 0:
+        sr = pd.Series(range(1, len(out)+1), index=out.index)
+    
     out['SingleRowHistoricalRank'] = safe_rank(sr, ascending=True).astype(int)
     out['DuePressureRank'] = safe_rank(sr, ascending=False).astype(int)
     
     out['HybridScore'] = 0.50 * out['DynamicRank'] + 0.35 * out['SingleRowHistoricalRank'] + 0.15 * out['DuePressureRank']
     out['HybridFinalRank'] = safe_rank(out['HybridScore'], ascending=True).astype(int)
     
-    # ROBUST Actual Members To Play
-    play_candidates = ['ActualBoxPlay', 'ActualBoxPlayDisplay', 'BoxPlayInstruction', 
-                       'RecommendedPlay', 'PredictedMember', 'Top1', 'ActualMembersToPlay']
-    play_col = next((c for c in play_candidates if c in out.columns), None)
-    
+    # Robust Actual Play Count
+    play_col = next((c for c in ['ActualBoxPlay', 'ActualBoxPlayDisplay', 'RecommendedPlay', 'PredictedMember', 'Top1'] if c in out.columns), None)
     if play_col:
         out['ActualMembersToPlay'] = out[play_col].fillna('0025').astype(str)
     else:
-        out['ActualMembersToPlay'] = pd.Series('0025', index=out.index)
+        out['ActualMembersToPlay'] = '0025'
     
-    out['ActualPlayCount'] = out['ActualMembersToPlay'].str.count(r'0025|0225|0255').clip(lower=1).astype(int)
-    out['Action'] = out['ActualPlayCount'].map({1:'TOP1', 2:'TOP2', 3:'TOP3', 0:'NO PLAY'})
+    # Limit to realistic 1-3 plays per stream
+    out['ActualPlayCount'] = out['ActualMembersToPlay'].str.count(r'0025|0225|0255').clip(lower=1, upper=3).astype(int)
+    out['Action'] = out['ActualPlayCount'].map({1:'TOP1', 2:'TOP2', 3:'TOP3'})
     out['RowCostDisplay'] = (out['ActualPlayCount'] * 0.25).map(lambda x: f"${x:.2f}")
     
     # Final sort + running totals
@@ -113,7 +113,7 @@ def build_true_hybrid_rank_actual_cost(playlist):
     out['RunningPlayTotal'] = out['ActualPlayCount'].cumsum()
     out['RunningCostDisplay'] = (out['RunningPlayTotal'] * 0.25).map(lambda x: f"${x:.2f}")
     
-    # Column order (important fields first)
+    # Column order
     front = ['PlayOrder', 'HybridFinalRank', 'HybridScore', 'StreamKey', 'State', 'Game',
              'Action', 'ActualMembersToPlay', 'ActualPlayCount', 'RowCostDisplay',
              'RunningPlayTotal', 'RunningCostDisplay', 'OldStreamRank', 'DynamicRank',
@@ -169,4 +169,4 @@ with tab2:
     else:
         st.warning("Upload Static Model + Separator Library + Mandatory Bridge History")
 
-st.caption("v145: Hybrid ranking stabilized with safe fallbacks. ActualMembersToPlay error fixed.")
+st.caption("v146: Hybrid ranking with strong fallbacks + realistic play count (max 3 per stream).")
